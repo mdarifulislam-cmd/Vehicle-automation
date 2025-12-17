@@ -172,26 +172,28 @@ elif page == "Truck_LoadPlan":
         sku_name = st.text_input("SKU NAME", "")
         submit = st.form_submit_button("Save")
 
-    if submit and truck and sku_id and qty > 0:
-        if submit and truck and sku_id and qty > 0:
-    new_row = pd.DataFrame([
-        {
-            "Truck ID/Name": truck,
-            "SKU_ID": sku_id,
-            "Qty": int(qty),
-            "SKU NAME": sku_name,
-            "SavedAt": datetime.now().isoformat(timespec="seconds"),
-        }
-    ])
+    if submit:
+    if not truck or not sku_id or qty <= 0:
+        st.error("Truck ID/Name, SKU_ID and Qty are required.")
+    else:
+        new_row = pd.DataFrame([
+            {
+                "Truck ID/Name": truck,
+                "SKU_ID": sku_id,
+                "Qty": int(qty),
+                "SKU NAME": sku_name,
+                "SavedAt": datetime.now().isoformat(timespec="seconds"),
+            }
+        ])
 
-    conn.append(
-        worksheet="Truck_LoadPlan",
-        data=new_row
-    )
+        conn.append(
+            worksheet="Truck_LoadPlan",
+            data=new_row
+        )
 
-    st.success("Saved!")
-    st.cache_data.clear()
-    st.rerun()
+        st.success("Saved!")
+        st.cache_data.clear()
+        st.rerun()
 
 
 # ============================================================
