@@ -73,18 +73,16 @@ def filter_by_edd(df: pd.DataFrame, from_dt: pd.Timestamp, to_dt_excl: pd.Timest
     return df[(df["Earliest Delivery Date"] >= from_dt) & (df["Earliest Delivery Date"] < to_dt_excl)]
 
 # ============================================================
-# WRITE HELPERS (gspread) - to insert into first blank row
+# WRITE HELPERS (gspread) - insert into first blank row
 # ============================================================
 def _get_gspread_client():
-    """
-    Supports either flat secrets or nested service_account secrets.
-    """
     cfg = st.secrets["connections"]["gsheets"]
 
+    # Supports both nested and flat secrets
     if "service_account" in cfg:
         sa = cfg["service_account"]
     else:
-        sa = cfg  # flat
+        sa = cfg
 
     creds_dict = {
         "type": "service_account",
@@ -109,33 +107,18 @@ def _open_spreadsheet():
     spreadsheet = cfg["spreadsheet"]
     gc = _get_gspread_client()
 
-    # Accept either full URL or only Sheet ID
     if "docs.google.com" in spreadsheet:
-        sh = gc.open_by_url(spreadsheet)
-    else:
-        sh = gc.open_by_key(spreadsheet)
-
-    return sh
+        return gc.open_by_url(spreadsheet)
+    return gc.open_by_key(spreadsheet)
 
 def _first_blank_row_in_colA(ws, start_row=2, scan_rows=5000):
-    """
-    Finds first blank row using column A.
-    Returns actual sheet row number.
-    """
-    # Read A2:A5000
     rng = f"A{start_row}:A{scan_rows}"
     vals = ws.get(rng)
 
-    # vals is list of rows: [["x"], [""], ...] or [] for empty rows
     for i, row in enumerate(vals, start=start_row):
-        if not row:
-            return i
-        if len(row) == 0:
-            return i
-        if str(row[0]).strip() == "":
+        if not row or str(row[0]).strip() == "":
             return i
 
-    # If no blanks found, write after last scanned row
     return scan_rows + 1
 
 def _colnum_to_letter(n: int) -> str:
@@ -148,8 +131,8 @@ def _colnum_to_letter(n: int) -> str:
 def push_input_rows_to_data_main(input_df: pd.DataFrame, selected_idx: list[int]):
     """
     Writes selected input_df rows into Data Main Sheet,
-    placing them at first blank row (by column A) and continuing downward.
-    Columns are mapped by header names (intersection).
+    placing them at the first blank row (based on column A).
+    Mapping is done by matching column headers.
     """
     if not selected_idx:
         return 0
@@ -157,7 +140,6 @@ def push_input_rows_to_data_main(input_df: pd.DataFrame, selected_idx: list[int]
     sh = _open_spreadsheet()
     ws_main = sh.worksheet("Data Main Sheet")
 
-    # Get Data Main Sheet headers from row 1
     main_headers = ws_main.row_values(1)
     if not main_headers:
         raise ValueError("Data Main Sheet row 1 has no headers.")
@@ -165,10 +147,8 @@ def push_input_rows_to_data_main(input_df: pd.DataFrame, selected_idx: list[int]
     main_col_count = len(main_headers)
     last_col_letter = _colnum_to_letter(main_col_count)
 
-    # Find first blank row in column A
     start_row = _first_blank_row_in_colA(ws_main, start_row=2, scan_rows=5000)
 
-    # Prepare values aligned to Data Main headers
     values_to_write = []
     for ridx in selected_idx:
         row_series = input_df.iloc[ridx]
@@ -228,10 +208,7 @@ if not data_main.empty and "Earliest Delivery Date" in data_main.columns:
 if "Qnt(Bag)" in data_main.columns:
     data_main["Qnt(Bag)"] = to_num(data_main["Qnt(Bag)"])
 
-# ============================================================
-# Detect FIRST worksheet (Input sheet)
-# ============================================================
-# We use gspread to list worksheets so “first sheet” is truly the first tab in the spreadsheet.
+# Detect FIRST worksheet name via gspread
 try:
     sh = _open_spreadsheet()
     worksheet_titles = [w.title for w in sh.worksheets()]
@@ -239,8 +216,8 @@ try:
 except Exception:
     FIRST_SHEET_NAME = None
 
-# Read the first sheet via connection (if we know its name)
-input_sheet_df = read_ws(FIRST_SHEET_NAME) if FIRST_SHEET_NAME else pd.DataFrame()
+# Read FIRST sheet with headers row 5 => header index = 4
+input_sheet_df = read_ws(FIRST_SHEET_NAME, header=4) if FIRST_SHEET_NAME else pd.DataFrame()
 
 # ============================================================
 # PAGE: DASHBOARD
@@ -282,26 +259,28 @@ if page == "Dashboard":
     st.dataframe(table_search(df, q), use_container_width=True)
 
 # ============================================================
-# PAGE: INPUT (Push rows to Data Main Sheet)
+# PAGE: INPUT
 # ============================================================
 elif page == "Input (Push to Data Main)":
-    st.title("📥 Input → Push into Data Main Sheet")
+    st.title("Input Sheet")  # BIG TITLE AS REQUESTED
 
     if not FIRST_SHEET_NAME:
         st.error("Could not detect the first worksheet name.")
         st.stop()
 
-    st.caption(f"Detected 1st tab (Input Sheet): **{FIRST_SHEET_NAME}**")
+    st.caption(f"Detected 1st tab: **{FIRST_SHEET_NAME}** (Headers row = 5)")
 
     if input_sheet_df.empty:
         st.info("Input sheet is empty or could not be read.")
         st.stop()
 
-    st.subheader("Input Sheet (live)")
-    q = st.text_input("Search Input Sheet")
-    view = table_search(input_sheet_df, q).reset_index(drop=True)
+    # Only show columns A..C
+    input_subset = input_sheet_df.iloc[:, 0:3] if input_sheet_df.shape[1] >= 3 else input_sheet_df
 
-    # Add selection column for UI only
+    st.subheader("Input Data (A–C)")
+    q = st.text_input("Search Input Sheet (A–C)")
+    view = table_search(input_subset, q).reset_index(drop=True)
+
     view2 = view.copy()
     view2.insert(0, "✅ Push?", False)
 
@@ -315,13 +294,9 @@ elif page == "Input (Push to Data Main)":
     st.markdown("### Push selected rows into **Data Main Sheet**")
     if st.button("🚀 Push Now"):
         selected_mask = edited["✅ Push?"] == True
-        selected_rows = edited[selected_mask].drop(columns=["✅ Push?"], errors="ignore")
-
-        if selected_rows.empty:
+        if selected_mask.sum() == 0:
             st.warning("No rows selected.")
         else:
-            # Map selected rows back to original view indices
-            # We need indices in view dataframe
             selected_idx = edited.index[selected_mask].tolist()
 
             try:
@@ -333,7 +308,7 @@ elif page == "Input (Push to Data Main)":
                 st.error(f"Failed to push rows: {e}")
 
 # ============================================================
-# PAGE: TRUCK PRIORITY (show only G to K)
+# PAGE: TRUCK PRIORITY (G-K)
 # ============================================================
 elif page == "Truck_Priority":
     st.title("⭐ Truck_Priority (Real Sequencing)")
@@ -342,14 +317,13 @@ elif page == "Truck_Priority":
         st.info("Truck_Priority sheet is empty or not found.")
         st.stop()
 
-    # Show only columns G..K => index 6..10
     subset = truck_priority.iloc[:, 6:11] if truck_priority.shape[1] >= 11 else truck_priority
 
-    q = st.text_input("Search Truck_Priority (G-K)")
+    q = st.text_input("Search Truck_Priority (G–K)")
     st.dataframe(table_search(subset, q), use_container_width=True)
 
 # ============================================================
-# PAGE: SKU MASTER (show only A..E, from row 2 onwards)
+# PAGE: SKU MASTER (A-E)
 # ============================================================
 elif page == "SKU MASTER":
     st.title("📦 SKU MASTER")
@@ -358,19 +332,16 @@ elif page == "SKU MASTER":
         st.info("SKU MASTER is empty or not found.")
         st.stop()
 
-    # Only columns A..E
     subset = sku_master.iloc[:, 0:5] if sku_master.shape[1] >= 5 else sku_master
 
-    q = st.text_input("Search SKU MASTER (A-E)")
+    q = st.text_input("Search SKU MASTER (A–E)")
     st.dataframe(table_search(subset, q), use_container_width=True)
 
 # ============================================================
-# PAGE: TRUCK LOADPLAN (VIEW ONLY - no input module)
+# PAGE: TRUCK LOADPLAN (VIEW ONLY)
 # ============================================================
 elif page == "Truck_LoadPlan":
     st.title("🧾 Truck_LoadPlan (View only)")
-    st.caption("No input module here (as requested).")
-
     st.dataframe(truck_lp, use_container_width=True)
 
 # ============================================================
@@ -378,7 +349,6 @@ elif page == "Truck_LoadPlan":
 # ============================================================
 elif page == "Data Main Sheet":
     st.title("📄 Data Main Sheet")
-
     df = filter_by_edd(data_main, from_dt, to_dt_excl)
     q = st.text_input("Search Data Main Sheet")
     st.dataframe(table_search(df, q), use_container_width=True)
