@@ -13,7 +13,7 @@ import plotly.express as px
 
 # ✅ Visual AM/PM time picker component (clock UI)
 try:
-    from st_time_entry import st_time_entry  # pip install st-time-entry
+    from st_time_entry import st_time_entry
 except Exception:
     st_time_entry = None
 
@@ -109,10 +109,6 @@ def time_to_12h_str_from_timeobj(t: dtime) -> str:
     return datetime.combine(date.today(), t).strftime("%I:%M %p")
 
 def normalize_component_time_str(s: str) -> str:
-    """
-    st-time-entry returns like '09:30 am' (lowercase).
-    Convert to '09:30 AM' to match your sheet format.
-    """
     s = (s or "").strip()
     if not s:
         return ""
@@ -120,7 +116,6 @@ def normalize_component_time_str(s: str) -> str:
         dt = datetime.strptime(s.lower(), "%I:%M %p")
         return dt.strftime("%I:%M %p")
     except Exception:
-        # fallback: best-effort upper
         return s.upper()
 
 # ============================================================
@@ -235,7 +230,6 @@ def push_current_input_to_data_main(input_tab_name: str):
     r = first_blank_row_colA(ws_main, start_row=2)
     ensure_rows(ws_main, r)
 
-    # ONLY A..I (J+ formulas untouched)
     updates = {
         f"A{r}": merged_A,
         f"B{r}": form["SKU"],
@@ -251,10 +245,28 @@ def push_current_input_to_data_main(input_tab_name: str):
     return r, form
 
 # ============================================================
-# DASHBOARD COLUMN DETECTION + SAFE FALLBACK
+# DASHBOARD COLUMN DETECTION (FIXED)
 # ============================================================
+def _safe_colname(x) -> str:
+    if x is None:
+        return ""
+    try:
+        if pd.isna(x):
+            return ""
+    except Exception:
+        pass
+    return str(x).strip()
+
 def pick_first_existing(df: pd.DataFrame, candidates: list[str]) -> str | None:
-    cols_lower = {c.lower(): c for c in df.columns}
+    """
+    ✅ FIX: df.columns may contain non-strings / NaN / None.
+    """
+    cols_lower = {}
+    for c in df.columns:
+        name = _safe_colname(c)
+        if not name:
+            continue
+        cols_lower[name.lower()] = c
     for cand in candidates:
         if cand.lower() in cols_lower:
             return cols_lower[cand.lower()]
@@ -325,7 +337,7 @@ if not sku_master.empty and sku_master.shape[1] >= 1:
     sku_name_options = [x.strip() for x in sku_master.iloc[:, 0].astype(str).fillna("") if x.strip()]
 
 # ============================================================
-# DASHBOARD (hardened: no crashes + charts if possible)
+# DASHBOARD (now works)
 # ============================================================
 if page == "Dashboard":
     st.title("🚚 Dashboard")
@@ -343,7 +355,6 @@ if page == "Dashboard":
         truck_col = truck_col or f_truck
         sku_id_col = sku_id_col or f_sku
 
-    # Parse EDD safely
     if edd_col and edd_col in dm.columns:
         dm[edd_col] = pd.to_datetime(dm[edd_col], errors="coerce")
         dm = dm[(dm[edd_col].notna()) & (dm[edd_col] >= from_dt) & (dm[edd_col] < to_dt_excl)]
@@ -352,10 +363,9 @@ if page == "Dashboard":
         st.info("No data found for selected date range.")
         st.stop()
 
-    # Interactive controls (upper portion)
+    # Interactive controls
     with st.container():
         cA, cB, cC, cD = st.columns([2, 2, 2, 1])
-
         selected_trucks = []
         selected_skus = []
         top_n = 15
@@ -388,13 +398,11 @@ if page == "Dashboard":
         st.info("No rows after filters.")
         st.stop()
 
-    # Qty safe numeric
     if qty_col and qty_col in dm.columns:
         dm[qty_col] = pd.to_numeric(dm[qty_col], errors="coerce").fillna(0)
     else:
-        qty_col = None  # prevent chart errors
+        qty_col = None
 
-    # Metrics
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Rows", f"{len(dm):,}")
     if truck_col and truck_col in dm.columns:
@@ -410,7 +418,7 @@ if page == "Dashboard":
     with left:
         if edd_col and qty_col:
             tmp = dm[[edd_col, qty_col]].copy()
-            tmp["EDD_Date"] = tmp[edd_col].dt.date
+            tmp["EDD_Date"] = pd.to_datetime(tmp[edd_col], errors="coerce").dt.date
             daily = tmp.groupby("EDD_Date", as_index=False)[qty_col].sum()
             if not daily.empty:
                 st.plotly_chart(px.line(daily, x="EDD_Date", y=qty_col, markers=True), use_container_width=True)
@@ -438,7 +446,7 @@ if page == "Dashboard":
     st.dataframe(dm.head(300), use_container_width=True)
 
 # ============================================================
-# INPUT PAGE (visual clock picker with AM/PM)
+# INPUT PAGE (visual clock picker kept)
 # ============================================================
 elif page == "Input (Push to Data Main)":
     st.title("Input Sheet")
@@ -469,11 +477,8 @@ elif page == "Input (Push to Data Main)":
                 value=pd.to_datetime(current["Delivery Date"], errors="coerce").date() if current["Delivery Date"] else date.today()
             )
 
-            # ✅ VISUAL clock picker (AM/PM) via st-time-entry; fallback to st.time_input
             if st_time_entry is not None:
-                delivery_time = normalize_component_time_str(
-                    st_time_entry("Delivery Time (B7)", key="t_delivery")
-                )
+                delivery_time = normalize_component_time_str(st_time_entry("Delivery Time (B7)", key="t_delivery"))
                 if not delivery_time:
                     delivery_time = time_to_12h_str_from_timeobj(datetime.now().time().replace(second=0, microsecond=0))
             else:
@@ -484,7 +489,9 @@ elif page == "Input (Push to Data Main)":
                 )
                 delivery_time = time_to_12h_str_from_timeobj(delivery_time_obj)
 
-            if not sku_name_options:
+            if not sku_master.empty and sku_master.shape[1] >= 1:
+                pass
+            else:
                 st.error("SKU MASTER is empty (cannot build dropdown).")
                 st.stop()
 
@@ -512,9 +519,7 @@ elif page == "Input (Push to Data Main)":
             )
 
             if st_time_entry is not None:
-                vin_time = normalize_component_time_str(
-                    st_time_entry("Vehicle Factory In Time (B13)", key="t_in")
-                )
+                vin_time = normalize_component_time_str(st_time_entry("Vehicle Factory In Time (B13)", key="t_in"))
                 if not vin_time:
                     vin_time = time_to_12h_str_from_timeobj(datetime.now().time().replace(second=0, microsecond=0))
             else:
@@ -531,9 +536,7 @@ elif page == "Input (Push to Data Main)":
             )
 
             if st_time_entry is not None:
-                vout_time = normalize_component_time_str(
-                    st_time_entry("Vehicle Factory Out Time (B15)", key="t_out")
-                )
+                vout_time = normalize_component_time_str(st_time_entry("Vehicle Factory Out Time (B15)", key="t_out"))
                 if not vout_time:
                     vout_time = time_to_12h_str_from_timeobj(datetime.now().time().replace(second=0, microsecond=0))
             else:
@@ -554,14 +557,14 @@ elif page == "Input (Push to Data Main)":
         try:
             updates = {
                 "B6": delivery_date.strftime("%Y-%m-%d"),
-                "B7": delivery_time,  # 12h string
+                "B7": delivery_time,
                 "B8": sku_selected,
                 "B10": int(qty),
                 "B11": str(truck_id).strip().upper(),
                 "B12": vin_date.strftime("%Y-%m-%d"),
-                "B13": vin_time,      # 12h string
+                "B13": vin_time,
                 "B14": vout_date.strftime("%Y-%m-%d"),
-                "B15": vout_time,     # 12h string
+                "B15": vout_time,
             }
             ws_batch_update(ws_input, updates, user_entered=True)
 
@@ -589,9 +592,6 @@ elif page == "Input (Push to Data Main)":
         except Exception as e:
             st.error(f"Failed to push: {e}")
 
-# ============================================================
-# OTHER PAGES (unchanged)
-# ============================================================
 elif page == "Truck_Priority":
     st.title("⭐ Truck_Priority (G–K only)")
     if truck_priority.empty:
