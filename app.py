@@ -1,6 +1,8 @@
-from streamlit_gsheets import GSheetsConnection
 import streamlit as st
 
-conn = st.connection("gsheets", type=GSheetsConnection)
-df_main = conn.read(worksheet="Data Main Sheet")
-st.dataframe(df_main.head())
+cfg = st.secrets["connections"]["gsheets"]
+st.write("Top-level keys:", list(cfg.keys()))
+st.write("Top-level type:", cfg.get("type"))
+st.write("Has nested service_account:", "service_account" in cfg)
+if "service_account" in cfg:
+    st.write("Nested keys:", list(cfg["service_account"].keys()))
