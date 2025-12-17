@@ -133,10 +133,6 @@ def _open_spreadsheet():
     return gc.open_by_key(spreadsheet)
 
 def first_blank_row_colA(ws, start_row=2) -> int:
-    """
-    Finds first blank row in column A (trimmed).
-    If data ends at 361, returns 362.
-    """
     max_row = ws.row_count
     colA = ws.col_values(1)
     if len(colA) < max_row:
@@ -152,8 +148,7 @@ def ensure_rows(ws, needed_last_row: int):
 
 def batch_update_cells(ws, cell_to_value: dict):
     """
-    Writes ONLY given cells (no rectangle writes).
-    This protects ARRAYFORMULA (J onward).
+    Writes ONLY given cells (A..I only). Does not affect J+ formulas.
     """
     body = {"valueInputOption": "USER_ENTERED", "data": []}
     for a1, val in cell_to_value.items():
@@ -161,13 +156,13 @@ def batch_update_cells(ws, cell_to_value: dict):
     ws.batch_update(body)
 
 # ============================================================
-# INPUT SHEET: READ FORM (A labels, B values)
+# INPUT FORM CELLS (your layout)
 # ============================================================
 INPUT_FORM_CELLS = {
     "Delivery Date": "B6",
     "Delivery Time": "B7",
     "SKU": "B8",
-    "SKU ID": "B9",  # formula cell
+    "SKU ID": "B9",  # formula - NEVER write it
     "Enter Quantity": "B10",
     "Truck ID/Name": "B11",
     "Vehicle Factory In Date": "B12",
@@ -182,9 +177,6 @@ def read_input_form(ws_input) -> dict:
         vals[k] = ws_input.acell(addr).value
     return vals
 
-# ============================================================
-# PUSH: INPUT FORM -> DATA MAIN (A..I ONLY)
-# ============================================================
 def push_current_input_to_data_main(input_tab_name: str):
     sh = _open_spreadsheet()
     ws_input = sh.worksheet(input_tab_name)
@@ -192,26 +184,26 @@ def push_current_input_to_data_main(input_tab_name: str):
 
     form = read_input_form(ws_input)
 
-    # Validate required
+    # basic required checks
     if not form["Delivery Date"] or not form["Delivery Time"]:
-        raise ValueError("Delivery Date/Time is blank.")
-    if not form["SKU"] or not form["SKU ID"]:
-        raise ValueError("SKU / SKU ID is blank (check dropdown + formula).")
+        raise ValueError("Delivery Date / Delivery Time is blank.")
+    if not form["SKU"]:
+        raise ValueError("SKU is blank.")
+    if not form["SKU ID"]:
+        raise ValueError("SKU ID (B9 formula) is blank. Select SKU first.")
     if not form["Enter Quantity"]:
         raise ValueError("Enter Quantity is blank.")
     if not form["Truck ID/Name"]:
         raise ValueError("Truck ID/Name is blank.")
 
-    # Merge Delivery Date+Time into Data Main A
     merged_A = merge_delivery_datetime(form["Delivery Date"], form["Delivery Time"])
     if not merged_A:
-        raise ValueError("Could not merge Delivery Date+Time. Check time format.")
+        raise ValueError("Could not merge Delivery Date+Time. Ensure Delivery Time is like 03:42 PM.")
 
-    # Find next row
     r = first_blank_row_colA(ws_main, start_row=2)
     ensure_rows(ws_main, r)
 
-    # Write ONLY A..I (J onward untouched)
+    # Write ONLY A..I (J+ untouched)
     updates = {
         f"Data Main Sheet!A{r}": merged_A,
         f"Data Main Sheet!B{r}": form["SKU"],
@@ -228,7 +220,7 @@ def push_current_input_to_data_main(input_tab_name: str):
     return r, form
 
 # ============================================================
-# SIDEBAR / NAV + DATE FILTER
+# SIDEBAR / NAV + DATE FILTER (kept)
 # ============================================================
 st.sidebar.title("Truck Sequencing Live")
 
@@ -256,101 +248,137 @@ if st.sidebar.button("🔄 Refresh data"):
     st.rerun()
 
 # ============================================================
-# LOAD SHEETS (READ)
+# LOAD SHEETS
 # ============================================================
 data_main = read_ws("Data Main Sheet")
 sku_master = read_ws("SKU MASTER")
 truck_lp = read_ws("Truck_LoadPlan", header=6)        # headers row 7
 truck_priority = read_ws("Truck_Priority", header=8)  # headers row 9
 
-# Detect all worksheet names (so you can choose input tab if needed)
+# Detect input tab: FIRST worksheet (no sidebar option)
 try:
     sh = _open_spreadsheet()
     worksheet_titles = [w.title for w in sh.worksheets()]
+    INPUT_TAB_NAME = worksheet_titles[0] if worksheet_titles else ""
 except Exception:
-    worksheet_titles = []
+    INPUT_TAB_NAME = ""
 
-# Default input tab = first tab (your Input form)
-default_input_tab = worksheet_titles[0] if worksheet_titles else ""
-input_tab = st.sidebar.selectbox("Input Tab", worksheet_titles, index=0 if worksheet_titles else None)
+# Build SKU dropdown from SKU MASTER (SKU Name + ID)
+sku_name_options = []
+sku_id_lookup = {}
+if not sku_master.empty and sku_master.shape[1] >= 2:
+    names = sku_master.iloc[:, 0].astype(str).fillna("")
+    ids = sku_master.iloc[:, 1].astype(str).fillna("")
+    for n, sid in zip(names, ids):
+        n2 = n.strip()
+        if n2:
+            sku_name_options.append(n2)
+            sku_id_lookup[n2] = sid.strip()
 
 # ============================================================
-# DASHBOARD
+# DASHBOARD (restore line chart + bar chart)
 # ============================================================
 if page == "Dashboard":
     st.title("🚚 Dashboard")
 
-    # Best effort: use "Earliest Delivery Date" if present
-    if not data_main.empty and "Earliest Delivery Date" in data_main.columns:
-        dm = data_main.copy()
+    dm = data_main.copy()
+    if dm.empty:
+        st.info("Data Main Sheet is empty.")
+        st.stop()
+
+    # Filter by EDD if available
+    if "Earliest Delivery Date" in dm.columns:
         dm["Earliest Delivery Date"] = pd.to_datetime(dm["Earliest Delivery Date"], errors="coerce")
         dm = dm[(dm["Earliest Delivery Date"] >= from_dt) & (dm["Earliest Delivery Date"] < to_dt_excl)]
-    else:
-        dm = data_main.copy()
 
     if dm.empty:
         st.info("No data found for selected date range.")
         st.stop()
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("Rows", f"{len(dm):,}")
-
     if "Truck ID/Name" in dm.columns:
         c2.metric("Trucks", f"{dm['Truck ID/Name'].nunique():,}")
+    if "SKU ID" in dm.columns:
+        c3.metric("SKUs", f"{dm['SKU ID'].nunique():,}")
     if "Qnt(Bag)" in dm.columns:
-        qsum = pd.to_numeric(dm["Qnt(Bag)"], errors="coerce").fillna(0).sum()
-        c3.metric("Total Qty(Bag)", f"{qsum:,.0f}")
+        dm["Qnt(Bag)"] = pd.to_numeric(dm["Qnt(Bag)"], errors="coerce").fillna(0)
+        c4.metric("Total Bags", f"{dm['Qnt(Bag)'].sum():,.0f}")
 
     st.divider()
 
-    if "Truck ID/Name" in dm.columns and "Qnt(Bag)" in dm.columns:
-        tmp = dm.copy()
-        tmp["Qnt(Bag)"] = pd.to_numeric(tmp["Qnt(Bag)"], errors="coerce").fillna(0)
-        top = tmp.groupby("Truck ID/Name", as_index=False)["Qnt(Bag)"].sum().sort_values("Qnt(Bag)", ascending=False).head(15)
-        st.plotly_chart(px.bar(top, x="Truck ID/Name", y="Qnt(Bag)"), use_container_width=True)
+    left, right = st.columns(2)
+
+    # ✅ Line chart (as before): daily bags vs EDD
+    with left:
+        if "Earliest Delivery Date" in dm.columns and "Qnt(Bag)" in dm.columns:
+            tmp = dm.copy()
+            tmp["EDD_Date"] = tmp["Earliest Delivery Date"].dt.date
+            daily = tmp.groupby("EDD_Date", as_index=False)["Qnt(Bag)"].sum()
+            st.plotly_chart(px.line(daily, x="EDD_Date", y="Qnt(Bag)", markers=True), use_container_width=True)
+        else:
+            st.info("Line chart needs 'Earliest Delivery Date' and 'Qnt(Bag)' columns.")
+
+    # Bar chart: top trucks
+    with right:
+        if "Truck ID/Name" in dm.columns and "Qnt(Bag)" in dm.columns:
+            top = dm.groupby("Truck ID/Name", as_index=False)["Qnt(Bag)"].sum().sort_values("Qnt(Bag)", ascending=False).head(15)
+            st.plotly_chart(px.bar(top, x="Truck ID/Name", y="Qnt(Bag)"), use_container_width=True)
+        else:
+            st.info("Bar chart needs 'Truck ID/Name' and 'Qnt(Bag)' columns.")
 
     st.subheader("Filtered Data Preview")
-    st.dataframe(dm.head(200), use_container_width=True)
+    st.dataframe(dm.head(300), use_container_width=True)
 
 # ============================================================
-# INPUT PAGE
+# INPUT PAGE (dropdown + B9 untouched + Part 2 visible)
 # ============================================================
 elif page == "Input (Push to Data Main)":
     st.title("Input Sheet")
 
-    if not input_tab:
-        st.error("No input tab detected.")
+    if not INPUT_TAB_NAME:
+        st.error("Could not detect Input sheet (first tab).")
         st.stop()
 
-    st.caption(f"Input tab selected: **{input_tab}** (Form layout: labels in A, values in B)")
+    st.caption(f"Input tab: **{INPUT_TAB_NAME}** (Your form layout A-labels / B-values)")
 
-    # -------------------------
-    # PART 1: FORM (writes B6..B15)
-    # -------------------------
-    st.subheader("Part 1: Input Form (writes to cells B6–B15)")
+    sh_live = _open_spreadsheet()
+    ws_input = sh_live.worksheet(INPUT_TAB_NAME)
+
+    # --------------- PART 1 ---------------
+    st.subheader("Part 1: Input Form")
 
     now = datetime.now()
 
-    with st.form("input_cells_form"):
-        c1, c2 = st.columns(2)
+    # Read current values (so UI mirrors sheet)
+    current = read_input_form(ws_input)
 
-        with c1:
-            delivery_date = st.date_input("Delivery Date (B6)", value=date.today())
-            delivery_time = st.text_input("Delivery Time (B7) - 12 hour (e.g. 09:23 PM)", value=fmt_time_12h(now))
-            sku_name = st.text_input("SKU (B8) - dropdown in sheet", value="")  # dropdown exists in sheet UI
-            st.caption("Note: In Google Sheet, B8 is dropdown. Here you can type the exact SKU text if needed.")
-            qty = st.number_input("Enter Quantity (B10)", min_value=0, step=1)
+    with st.form("input_form"):
+        col1, col2 = st.columns(2)
 
-        with c2:
-            truck_id = st.text_input("Truck ID/Name (B11) e.g. DM-TA-224564", value="")
-            vin_date = st.date_input("Vehicle Factory In Date (B12)", value=date.today())
-            vin_time = st.text_input("Vehicle Factory In Time (B13) - 12 hour", value=fmt_time_12h(now))
-            vout_date = st.date_input("Vehicle Factory Out Date (B14)", value=date.today())
-            vout_time = st.text_input("Vehicle Factory Out Time (B15) - 12 hour", value=fmt_time_12h(now))
+        with col1:
+            delivery_date = st.date_input("Delivery Date (B6)", value=pd.to_datetime(current["Delivery Date"], errors="coerce").date() if current["Delivery Date"] else date.today())
+            delivery_time = st.text_input("Delivery Time (B7) - 12 hour", value=(current["Delivery Time"] or fmt_time_12h(now)))
 
-        save_form = st.form_submit_button("✅ Save to Input Sheet")
+            # ✅ REAL dropdown in Streamlit (from SKU MASTER)
+            sku_selected = st.selectbox("SKU (B8)", options=sku_name_options, index=sku_name_options.index(current["SKU"]) if current.get("SKU") in sku_name_options else 0)
 
-    if save_form:
+            # ✅ B9 is formula - show live value, do not edit
+            st.text_input("SKU ID (B9) - formula (read-only)", value=(current["SKU ID"] or ""), disabled=True)
+
+            qty = st.number_input("Enter Quantity (B10)", min_value=0, step=1, value=int(float(current["Enter Quantity"])) if str(current.get("Enter Quantity", "")).strip() not in ("", "None") else 0)
+
+        with col2:
+            truck_id = st.text_input("Truck ID/Name (B11)", value=(current["Truck ID/Name"] or ""))
+            vin_date = st.date_input("Vehicle Factory In Date (B12)", value=pd.to_datetime(current["Vehicle Factory In Date"], errors="coerce").date() if current["Vehicle Factory In Date"] else date.today())
+            vin_time = st.text_input("Vehicle Factory In Time (B13) - 12 hour", value=(current["Vehicle Factory In Time"] or fmt_time_12h(now)))
+            vout_date = st.date_input("Vehicle Factory Out Date (B14)", value=pd.to_datetime(current["Vehicle Factory Out Date"], errors="coerce").date() if current["Vehicle Factory Out Date"] else date.today())
+            vout_time = st.text_input("Vehicle Factory Out Time (B15) - 12 hour", value=(current["Vehicle Factory Out Time"] or fmt_time_12h(now)))
+
+        save_btn = st.form_submit_button("✅ Save to Input Sheet")
+
+    if save_btn:
+        # validate times
         for label, t in [
             ("Delivery Time", delivery_time),
             ("Vehicle Factory In Time", vin_time),
@@ -365,62 +393,53 @@ elif page == "Input (Push to Data Main)":
             st.stop()
 
         try:
-            sh2 = _open_spreadsheet()
-            ws_input = sh2.worksheet(input_tab)
-
-            # IMPORTANT: do NOT touch B9 (formula)
+            # ✅ write only B6,B7,B8,B10,B11,B12,B13,B14,B15 (never touch B9)
             updates = {
-                f"{input_tab}!B6": delivery_date.strftime("%Y-%m-%d"),
-                f"{input_tab}!B7": delivery_time.strip().upper(),
-                f"{input_tab}!B8": sku_name,  # if sheet has dropdown, it will accept matching option
-                f"{input_tab}!B10": int(qty),
-                f"{input_tab}!B11": truck_id.strip().upper(),
-                f"{input_tab}!B12": vin_date.strftime("%Y-%m-%d"),
-                f"{input_tab}!B13": vin_time.strip().upper(),
-                f"{input_tab}!B14": vout_date.strftime("%Y-%m-%d"),
-                f"{input_tab}!B15": vout_time.strip().upper(),
+                f"{INPUT_TAB_NAME}!B6": delivery_date.strftime("%Y-%m-%d"),
+                f"{INPUT_TAB_NAME}!B7": str(delivery_time).strip().upper(),
+                f"{INPUT_TAB_NAME}!B8": sku_selected,  # dropdown equivalent
+                f"{INPUT_TAB_NAME}!B10": int(qty),
+                f"{INPUT_TAB_NAME}!B11": str(truck_id).strip().upper(),
+                f"{INPUT_TAB_NAME}!B12": vin_date.strftime("%Y-%m-%d"),
+                f"{INPUT_TAB_NAME}!B13": str(vin_time).strip().upper(),
+                f"{INPUT_TAB_NAME}!B14": vout_date.strftime("%Y-%m-%d"),
+                f"{INPUT_TAB_NAME}!B15": str(vout_time).strip().upper(),
             }
 
             body = {"valueInputOption": "USER_ENTERED", "data": []}
             for rng, val in updates.items():
                 body["data"].append({"range": rng, "values": [[val]]})
-
             ws_input.batch_update(body)
-            st.success("Saved to Input sheet cells B6–B15 (B9 remains formula).")
-            st.cache_data.clear()
-            st.rerun()
+
+            # IMPORTANT: no st.rerun() (so page doesn't "jump" and hide Part 2)
+            st.success("Saved. SKU ID (B9) will update automatically from the sheet formula.")
+
+            # refresh current snapshot for Part 2 immediately
+            current = read_input_form(ws_input)
 
         except Exception as e:
-            st.error(f"Failed to write input cells: {e}")
+            st.error(f"Failed to save: {e}")
 
     st.divider()
 
-    # -------------------------
-    # PART 2: LIVE VIEW + PUSH CURRENT INPUT
-    # -------------------------
-    st.subheader("Part 2: Push current input line to Data Main Sheet")
+    # --------------- PART 2 ---------------
+    st.subheader("Part 2: Push to Data Main Sheet")
 
+    # Always show live preview (so after Save you see updated values here)
     try:
-        sh_live = _open_spreadsheet()
-        ws_input_live = sh_live.worksheet(input_tab)
-        form_vals = read_input_form(ws_input_live)
-
-        preview = pd.DataFrame(
-            [{"Field": k, "Value": v} for k, v in form_vals.items()]
-        )
+        current = read_input_form(ws_input)
+        preview = pd.DataFrame([{"Field": k, "Value": v} for k, v in current.items()])
         st.dataframe(preview, use_container_width=True, hide_index=True)
 
-        if st.button("🚀 Push NOW to Data Main Sheet (next blank row in column A)"):
-            row_written, pushed_vals = push_current_input_to_data_main(input_tab)
-            st.success(f"✅ Pushed to Data Main Sheet row {row_written}. (Should be 362 if data ends at 361)")
-            st.cache_data.clear()
-            st.rerun()
+        if st.button("🚀 Push NOW (to next blank row in Data Main column A)"):
+            row_written, pushed_vals = push_current_input_to_data_main(INPUT_TAB_NAME)
+            st.success(f"✅ Pushed to Data Main Sheet row {row_written} (should be 362 if data ends at 361).")
 
     except Exception as e:
-        st.error(f"Could not read/push input form: {e}")
+        st.error(f"Could not read/push: {e}")
 
 # ============================================================
-# TRUCK PRIORITY
+# TRUCK PRIORITY / SKU MASTER / LOADPLAN / DATA MAIN / SEQUENCING
 # ============================================================
 elif page == "Truck_Priority":
     st.title("⭐ Truck_Priority (G–K only)")
@@ -430,9 +449,6 @@ elif page == "Truck_Priority":
     subset = truck_priority.iloc[:, 6:11] if truck_priority.shape[1] >= 11 else truck_priority
     st.dataframe(subset, use_container_width=True)
 
-# ============================================================
-# SKU MASTER
-# ============================================================
 elif page == "SKU MASTER":
     st.title("📦 SKU MASTER (A–E only)")
     if sku_master.empty:
@@ -441,18 +457,12 @@ elif page == "SKU MASTER":
     subset = sku_master.iloc[:, 0:5] if sku_master.shape[1] >= 5 else sku_master
     st.dataframe(subset, use_container_width=True)
 
-# ============================================================
-# TRUCK LOADPLAN
-# ============================================================
 elif page == "Truck_LoadPlan":
     st.title("🧾 Truck_LoadPlan (View only)")
     st.dataframe(truck_lp, use_container_width=True)
 
-# ============================================================
-# DATA MAIN SHEET (FILTERED)
-# ============================================================
 elif page == "Data Main Sheet":
-    st.title("📄 Data Main Sheet (Filtered)")
+    st.title("📄 Data Main Sheet (Filtered by sidebar date range)")
 
     dm = data_main.copy()
     if not dm.empty and "Earliest Delivery Date" in dm.columns:
@@ -462,9 +472,6 @@ elif page == "Data Main Sheet":
     q = st.text_input("Search")
     st.dataframe(table_search(dm, q), use_container_width=True)
 
-# ============================================================
-# SEQUENCING (SIMPLE)
-# ============================================================
 else:
     st.title("🔢 Sequencing (Row Rank)")
 
@@ -477,7 +484,6 @@ else:
         st.info("No rows in selected date range.")
         st.stop()
 
-    # Sort by EDD then truck if present
     sort_cols = []
     if "Earliest Delivery Date" in dm.columns:
         sort_cols.append("Earliest Delivery Date")
