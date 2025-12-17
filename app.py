@@ -5,7 +5,11 @@ from datetime import datetime, date
 import plotly.express as px
 import time
 import random
+
 from streamlit_gsheets import GSheetsConnection
+
+import gspread
+from google.oauth2.service_account import Credentials
 
 # ============================================================
 # CONFIG
@@ -13,7 +17,7 @@ from streamlit_gsheets import GSheetsConnection
 st.set_page_config(page_title="Truck Sequencing Live", layout="wide")
 
 # ============================================================
-# CONNECTION
+# CONNECTION (READ)
 # ============================================================
 conn = st.connection("gsheets", type=GSheetsConnection)
 
@@ -48,11 +52,6 @@ def _cached_read(worksheet: str, header: int | None):
     return conn.read(worksheet=worksheet, header=header)
 
 def read_ws(worksheet: str, header: int | None = None) -> pd.DataFrame:
-    """
-    Safe reader:
-    - Caches results to avoid repeated API calls during reruns
-    - Retries transient API failures (rate limit / 500 / 503 / timeouts)
-    """
     max_tries = 5
     base_sleep = 0.7
 
@@ -74,19 +73,140 @@ def filter_by_edd(df: pd.DataFrame, from_dt: pd.Timestamp, to_dt_excl: pd.Timest
     return df[(df["Earliest Delivery Date"] >= from_dt) & (df["Earliest Delivery Date"] < to_dt_excl)]
 
 # ============================================================
+# WRITE HELPERS (gspread) - to insert into first blank row
+# ============================================================
+def _get_gspread_client():
+    """
+    Supports either flat secrets or nested service_account secrets.
+    """
+    cfg = st.secrets["connections"]["gsheets"]
+
+    if "service_account" in cfg:
+        sa = cfg["service_account"]
+    else:
+        sa = cfg  # flat
+
+    creds_dict = {
+        "type": "service_account",
+        "project_id": sa["project_id"],
+        "private_key_id": sa["private_key_id"],
+        "private_key": sa["private_key"],
+        "client_email": sa["client_email"],
+        "client_id": sa["client_id"],
+        "token_uri": sa.get("token_uri", "https://oauth2.googleapis.com/token"),
+    }
+
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+    return gspread.authorize(creds)
+
+@st.cache_resource(show_spinner=False)
+def _open_spreadsheet():
+    cfg = st.secrets["connections"]["gsheets"]
+    spreadsheet = cfg["spreadsheet"]
+    gc = _get_gspread_client()
+
+    # Accept either full URL or only Sheet ID
+    if "docs.google.com" in spreadsheet:
+        sh = gc.open_by_url(spreadsheet)
+    else:
+        sh = gc.open_by_key(spreadsheet)
+
+    return sh
+
+def _first_blank_row_in_colA(ws, start_row=2, scan_rows=5000):
+    """
+    Finds first blank row using column A.
+    Returns actual sheet row number.
+    """
+    # Read A2:A5000
+    rng = f"A{start_row}:A{scan_rows}"
+    vals = ws.get(rng)
+
+    # vals is list of rows: [["x"], [""], ...] or [] for empty rows
+    for i, row in enumerate(vals, start=start_row):
+        if not row:
+            return i
+        if len(row) == 0:
+            return i
+        if str(row[0]).strip() == "":
+            return i
+
+    # If no blanks found, write after last scanned row
+    return scan_rows + 1
+
+def _colnum_to_letter(n: int) -> str:
+    s = ""
+    while n:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+def push_input_rows_to_data_main(input_df: pd.DataFrame, selected_idx: list[int]):
+    """
+    Writes selected input_df rows into Data Main Sheet,
+    placing them at first blank row (by column A) and continuing downward.
+    Columns are mapped by header names (intersection).
+    """
+    if not selected_idx:
+        return 0
+
+    sh = _open_spreadsheet()
+    ws_main = sh.worksheet("Data Main Sheet")
+
+    # Get Data Main Sheet headers from row 1
+    main_headers = ws_main.row_values(1)
+    if not main_headers:
+        raise ValueError("Data Main Sheet row 1 has no headers.")
+
+    main_col_count = len(main_headers)
+    last_col_letter = _colnum_to_letter(main_col_count)
+
+    # Find first blank row in column A
+    start_row = _first_blank_row_in_colA(ws_main, start_row=2, scan_rows=5000)
+
+    # Prepare values aligned to Data Main headers
+    values_to_write = []
+    for ridx in selected_idx:
+        row_series = input_df.iloc[ridx]
+        row_dict = row_series.to_dict()
+
+        aligned = []
+        for h in main_headers:
+            aligned.append(row_dict.get(h, ""))
+
+        values_to_write.append(aligned)
+
+    end_row = start_row + len(values_to_write) - 1
+    target_range = f"A{start_row}:{last_col_letter}{end_row}"
+
+    ws_main.update(target_range, values_to_write)
+    return len(values_to_write)
+
+# ============================================================
 # SIDEBAR
 # ============================================================
 st.sidebar.title("Truck Sequencing Live")
 
 page = st.sidebar.radio(
     "Menu",
-    ["Dashboard", "Truck_LoadPlan", "Truck_Priority", "Sequencing (Row Rank)", "SKU MASTER", "Data Main Sheet"]
+    [
+        "Dashboard",
+        "Input (Push to Data Main)",
+        "Truck_Priority",
+        "SKU MASTER",
+        "Truck_LoadPlan",
+        "Data Main Sheet",
+        "Sequencing (Row Rank)",
+    ],
 )
 
 st.sidebar.markdown("### Date Range (Earliest Delivery Date)")
 from_date = st.sidebar.date_input("From", value=date(2025, 12, 12))
 to_date = st.sidebar.date_input("To", value=date(2025, 12, 18))
-
 from_dt = pd.to_datetime(from_date)
 to_dt_excl = pd.to_datetime(to_date) + pd.Timedelta(days=1)
 
@@ -95,23 +215,32 @@ if st.sidebar.button("🔄 Refresh data"):
     st.rerun()
 
 # ============================================================
-# LOAD DATA (LIVE)
+# LOAD SHEETS (READ)
 # ============================================================
 data_main = read_ws("Data Main Sheet")
 sku_master = read_ws("SKU MASTER")
+truck_lp = read_ws("Truck_LoadPlan", header=6)        # headers row 7
+truck_priority = read_ws("Truck_Priority", header=8)  # headers row 9
 
-# Truck_LoadPlan headers on row 7 => header index 6
-truck_lp = read_ws("Truck_LoadPlan", header=6)
-
-# Truck_Priority headers on row 9 => header index 8
-truck_priority = read_ws("Truck_Priority", header=8)
-
-# Normalize Data Main Sheet
+# Normalize main
 if not data_main.empty and "Earliest Delivery Date" in data_main.columns:
     data_main["Earliest Delivery Date"] = data_main["Earliest Delivery Date"].apply(safe_dt)
-
 if "Qnt(Bag)" in data_main.columns:
     data_main["Qnt(Bag)"] = to_num(data_main["Qnt(Bag)"])
+
+# ============================================================
+# Detect FIRST worksheet (Input sheet)
+# ============================================================
+# We use gspread to list worksheets so “first sheet” is truly the first tab in the spreadsheet.
+try:
+    sh = _open_spreadsheet()
+    worksheet_titles = [w.title for w in sh.worksheets()]
+    FIRST_SHEET_NAME = worksheet_titles[0] if worksheet_titles else None
+except Exception:
+    FIRST_SHEET_NAME = None
+
+# Read the first sheet via connection (if we know its name)
+input_sheet_df = read_ws(FIRST_SHEET_NAME) if FIRST_SHEET_NAME else pd.DataFrame()
 
 # ============================================================
 # PAGE: DASHBOARD
@@ -136,94 +265,128 @@ if page == "Dashboard":
     st.divider()
 
     left, right = st.columns(2)
-
     with left:
         if "Earliest Delivery Date" in df.columns and "Qnt(Bag)" in df.columns:
             tmp = df.copy()
             tmp["EDD_Date"] = tmp["Earliest Delivery Date"].dt.date
             daily = tmp.groupby("EDD_Date", as_index=False)["Qnt(Bag)"].sum()
-            fig = px.line(daily, x="EDD_Date", y="Qnt(Bag)", markers=True, title="Total Bags by EDD Date")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(px.line(daily, x="EDD_Date", y="Qnt(Bag)", markers=True), use_container_width=True)
 
     with right:
         if "Truck ID/Name" in df.columns and "Qnt(Bag)" in df.columns:
             top = df.groupby("Truck ID/Name", as_index=False)["Qnt(Bag)"].sum().sort_values("Qnt(Bag)", ascending=False).head(15)
-            fig2 = px.bar(top, x="Truck ID/Name", y="Qnt(Bag)", title="Top 15 Trucks by Bags")
-            st.plotly_chart(fig2, use_container_width=True)
+            st.plotly_chart(px.bar(top, x="Truck ID/Name", y="Qnt(Bag)"), use_container_width=True)
 
     st.subheader("Filtered Data")
     q = st.text_input("Search")
     st.dataframe(table_search(df, q), use_container_width=True)
 
 # ============================================================
-# PAGE: TRUCK LOADPLAN
+# PAGE: INPUT (Push rows to Data Main Sheet)
 # ============================================================
-elif page == "Truck_LoadPlan":
-    st.title("🧾 Truck_LoadPlan (Live)")
-    st.caption("Headers row = 7 (header=6).")
+elif page == "Input (Push to Data Main)":
+    st.title("📥 Input → Push into Data Main Sheet")
 
-    st.subheader("Current Truck_LoadPlan")
-    st.dataframe(truck_lp, use_container_width=True)
+    if not FIRST_SHEET_NAME:
+        st.error("Could not detect the first worksheet name.")
+        st.stop()
 
-    st.divider()
-    st.subheader("Add new row")
+    st.caption(f"Detected 1st tab (Input Sheet): **{FIRST_SHEET_NAME}**")
 
-    with st.form("add_lp"):
-        truck = st.text_input("Truck ID/Name")
-        sku_id = st.text_input("SKU_ID")
-        qty = st.number_input("Qty", min_value=0, step=1)
-        sku_name = st.text_input("SKU NAME (optional)", value="")
-        truck_rank = st.text_input("Truck Rank (optional)", value="")
-        line_score = st.text_input("Line Score (optional)", value="")
-        submitted = st.form_submit_button("✅ Save")
+    if input_sheet_df.empty:
+        st.info("Input sheet is empty or could not be read.")
+        st.stop()
 
-    # ✅ INDENTATION IS CORRECT HERE
-    if submitted:
-        if (not truck.strip()) or (not sku_id.strip()) or (qty <= 0):
-            st.error("Truck ID/Name, SKU_ID and Qty are required.")
+    st.subheader("Input Sheet (live)")
+    q = st.text_input("Search Input Sheet")
+    view = table_search(input_sheet_df, q).reset_index(drop=True)
+
+    # Add selection column for UI only
+    view2 = view.copy()
+    view2.insert(0, "✅ Push?", False)
+
+    edited = st.data_editor(
+        view2,
+        use_container_width=True,
+        num_rows="dynamic",
+        key="input_editor"
+    )
+
+    st.markdown("### Push selected rows into **Data Main Sheet**")
+    if st.button("🚀 Push Now"):
+        selected_mask = edited["✅ Push?"] == True
+        selected_rows = edited[selected_mask].drop(columns=["✅ Push?"], errors="ignore")
+
+        if selected_rows.empty:
+            st.warning("No rows selected.")
         else:
-            new_row = pd.DataFrame([{
-                "Truck ID/Name": truck.strip(),
-                "SKU_ID": sku_id.strip(),
-                "Qty": int(qty),
-                "SKU NAME": sku_name.strip(),
-                "Truck Rank": truck_rank.strip(),
-                "Line Score": line_score.strip(),
-                "SavedAt": datetime.now().isoformat(timespec="seconds"),
-            }])
+            # Map selected rows back to original view indices
+            # We need indices in view dataframe
+            selected_idx = edited.index[selected_mask].tolist()
 
-            conn.append(worksheet="Truck_LoadPlan", data=new_row)
-
-            st.success("Saved! Refreshing…")
-            st.cache_data.clear()
-            st.rerun()
+            try:
+                pushed_count = push_input_rows_to_data_main(view, selected_idx)
+                st.success(f"Pushed {pushed_count} row(s) into Data Main Sheet (first blank row in column A).")
+                st.cache_data.clear()
+                st.rerun()
+            except Exception as e:
+                st.error(f"Failed to push rows: {e}")
 
 # ============================================================
-# PAGE: TRUCK PRIORITY
+# PAGE: TRUCK PRIORITY (show only G to K)
 # ============================================================
 elif page == "Truck_Priority":
     st.title("⭐ Truck_Priority (Real Sequencing)")
-    st.caption("Headers row = 9 (header=8).")
 
     if truck_priority.empty:
         st.info("Truck_Priority sheet is empty or not found.")
         st.stop()
 
-    q = st.text_input("Search Truck_Priority")
-    view = table_search(truck_priority, q)
-    st.dataframe(view, use_container_width=True)
+    # Show only columns G..K => index 6..10
+    subset = truck_priority.iloc[:, 6:11] if truck_priority.shape[1] >= 11 else truck_priority
 
-    st.download_button(
-        "⬇️ Download Truck_Priority CSV",
-        data=view.to_csv(index=False).encode("utf-8"),
-        file_name="truck_priority.csv",
-        mime="text/csv",
-    )
+    q = st.text_input("Search Truck_Priority (G-K)")
+    st.dataframe(table_search(subset, q), use_container_width=True)
+
+# ============================================================
+# PAGE: SKU MASTER (show only A..E, from row 2 onwards)
+# ============================================================
+elif page == "SKU MASTER":
+    st.title("📦 SKU MASTER")
+
+    if sku_master.empty:
+        st.info("SKU MASTER is empty or not found.")
+        st.stop()
+
+    # Only columns A..E
+    subset = sku_master.iloc[:, 0:5] if sku_master.shape[1] >= 5 else sku_master
+
+    q = st.text_input("Search SKU MASTER (A-E)")
+    st.dataframe(table_search(subset, q), use_container_width=True)
+
+# ============================================================
+# PAGE: TRUCK LOADPLAN (VIEW ONLY - no input module)
+# ============================================================
+elif page == "Truck_LoadPlan":
+    st.title("🧾 Truck_LoadPlan (View only)")
+    st.caption("No input module here (as requested).")
+
+    st.dataframe(truck_lp, use_container_width=True)
+
+# ============================================================
+# PAGE: DATA MAIN SHEET
+# ============================================================
+elif page == "Data Main Sheet":
+    st.title("📄 Data Main Sheet")
+
+    df = filter_by_edd(data_main, from_dt, to_dt_excl)
+    q = st.text_input("Search Data Main Sheet")
+    st.dataframe(table_search(df, q), use_container_width=True)
 
 # ============================================================
 # PAGE: SEQUENCING (ROW RANK)
 # ============================================================
-elif page == "Sequencing (Row Rank)":
+else:
     st.title("🔢 Sequencing (Row Rank by EDD)")
 
     df = filter_by_edd(data_main, from_dt, to_dt_excl)
@@ -244,26 +407,3 @@ elif page == "Sequencing (Row Rank)":
 
     q = st.text_input("Search ranked data")
     st.dataframe(table_search(ranked, q), use_container_width=True)
-
-# ============================================================
-# PAGE: SKU MASTER
-# ============================================================
-elif page == "SKU MASTER":
-    st.title("📦 SKU MASTER")
-
-    if sku_master.empty:
-        st.info("SKU MASTER is empty or not found.")
-        st.stop()
-
-    q = st.text_input("Search SKU MASTER")
-    st.dataframe(table_search(sku_master, q), use_container_width=True)
-
-# ============================================================
-# PAGE: DATA MAIN SHEET
-# ============================================================
-else:
-    st.title("📄 Data Main Sheet")
-
-    df = filter_by_edd(data_main, from_dt, to_dt_excl)
-    q = st.text_input("Search Data Main Sheet")
-    st.dataframe(table_search(df, q), use_container_width=True)
