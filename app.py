@@ -1,5 +1,4 @@
 import streamlit as st
-
-s = st.secrets["connections"]["gsheets"]["spreadsheet"]
-st.write("Spreadsheet length:", len(s))
-st.write("Has newline:", ("\n" in s) or ("\r" in s))
+st.write("gsheets secrets keys:", list(st.secrets["connections"]["gsheets"].keys()))
+st.write("gsheets type:", st.secrets["connections"]["gsheets"].get("type"))
+st.write("spreadsheet:", st.secrets["connections"]["gsheets"].get("spreadsheet"))
