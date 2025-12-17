@@ -174,14 +174,14 @@ elif page == "Truck_LoadPlan":
 
     if submit and truck and sku_id and qty > 0:
         conn.append(
-            worksheet="Truck_LoadPlan",
-            data=pd.DataFrame([{
-                "Truck ID/Name": truck,
-                "SKU_ID": sku_id,
-                "Qty": int(qty),
-                "SKU NAME": sku_name,
-                "SavedAt": datetime.now().isoformat(timespec="seconds"),
-            }])
+    worksheet="Truck_LoadPlan",
+    data=pd.DataFrame([{
+        "Truck ID/Name": truck,
+        "SKU_ID": sku_id,
+        "Qty": int(qty),
+        "SKU NAME": sku_name,
+        "SavedAt": datetime.now().isoformat(timespec="seconds"),
+    }])
         st.success("Saved!")
         st.cache_data.clear()
         st.rerun()
