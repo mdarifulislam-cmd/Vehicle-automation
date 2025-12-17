@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import datetime, date
+from datetime import datetime, date, time as dtime
 import time
 import random
 import re
@@ -10,6 +10,12 @@ from streamlit_gsheets import GSheetsConnection
 import gspread
 from google.oauth2.service_account import Credentials
 import plotly.express as px
+
+# ✅ Visual AM/PM time picker component (clock UI)
+try:
+    from st_time_entry import st_time_entry  # pip install st-time-entry
+except Exception:
+    st_time_entry = None
 
 # ============================================================
 # CONFIG
@@ -55,10 +61,7 @@ def read_ws(worksheet: str, header: int | None = None) -> pd.DataFrame:
 # ============================================================
 # FORMATTING / VALIDATION
 # ============================================================
-def fmt_time_12h(now: datetime) -> str:
-    return now.strftime("%I:%M %p")  # 09:23 PM
-
-def parse_time_to_hms(t: str):
+def parse_time_to_hms(t):
     if t is None:
         return None
     s = str(t).strip().upper()
@@ -94,8 +97,31 @@ def merge_delivery_datetime(delivery_date_val, delivery_time_val) -> str:
     dt = datetime(d.year, d.month, d.day, h, mi, se)
     return f"{dt.month}/{dt.day}/{dt.year} {dt.hour}:{dt.minute:02d}:{dt.second:02d}"
 
-TIME_12H_PATTERN = r"^(0[1-9]|1[0-2]):[0-5][0-9]\s?(AM|PM)$"
 TRUCK_PATTERN = r"^[A-Z]{2}-[A-Z]{2}-\d{6}$"
+
+def parse_12h_to_time_obj(s: str) -> dtime:
+    try:
+        return datetime.strptime(str(s).strip().upper(), "%I:%M %p").time()
+    except Exception:
+        return datetime.now().time().replace(second=0, microsecond=0)
+
+def time_to_12h_str_from_timeobj(t: dtime) -> str:
+    return datetime.combine(date.today(), t).strftime("%I:%M %p")
+
+def normalize_component_time_str(s: str) -> str:
+    """
+    st-time-entry returns like '09:30 am' (lowercase).
+    Convert to '09:30 AM' to match your sheet format.
+    """
+    s = (s or "").strip()
+    if not s:
+        return ""
+    try:
+        dt = datetime.strptime(s.lower(), "%I:%M %p")
+        return dt.strftime("%I:%M %p")
+    except Exception:
+        # fallback: best-effort upper
+        return s.upper()
 
 # ============================================================
 # GSHEET WRITE (gspread)
@@ -151,13 +177,13 @@ def ws_batch_update(ws, updates: dict, user_entered=True):
     )
 
 # ============================================================
-# INPUT FORM CELLS (your layout)
+# INPUT FORM (single range read)
 # ============================================================
 INPUT_FIELDS_ORDER = [
     "Delivery Date",
     "Delivery Time",
     "SKU",
-    "SKU ID",  # formula
+    "SKU ID",
     "Enter Quantity",
     "Truck ID/Name",
     "Vehicle Factory In Date",
@@ -165,21 +191,15 @@ INPUT_FIELDS_ORDER = [
     "Vehicle Factory Out Date",
     "Vehicle Factory Out Time",
 ]
-
-# B6:B15 corresponds to above order
 INPUT_RANGE = "B6:B15"
 
 def read_input_form_range(ws_input) -> dict:
-    """
-    ✅ One API call + retry/backoff to avoid gspread APIError.
-    """
     max_tries = 5
     base_sleep = 0.6
     for i in range(max_tries):
         try:
-            raw = ws_input.get(INPUT_RANGE)  # list of rows like [[val],[val],...]
+            raw = ws_input.get(INPUT_RANGE)
             flat = [r[0] if r else "" for r in raw]
-            # pad to 10
             while len(flat) < len(INPUT_FIELDS_ORDER):
                 flat.append("")
             return {k: flat[idx] for idx, k in enumerate(INPUT_FIELDS_ORDER)}
@@ -210,12 +230,12 @@ def push_current_input_to_data_main(input_tab_name: str):
 
     merged_A = merge_delivery_datetime(form["Delivery Date"], form["Delivery Time"])
     if not merged_A:
-        raise ValueError("Could not merge Delivery Date+Time. Ensure Delivery Time is like 03:42 PM.")
+        raise ValueError("Could not merge Delivery Date+Time.")
 
     r = first_blank_row_colA(ws_main, start_row=2)
     ensure_rows(ws_main, r)
 
-    # ✅ ONLY A..I (J+ formulas untouched)
+    # ONLY A..I (J+ formulas untouched)
     updates = {
         f"A{r}": merged_A,
         f"B{r}": form["SKU"],
@@ -231,7 +251,7 @@ def push_current_input_to_data_main(input_tab_name: str):
     return r, form
 
 # ============================================================
-# DASHBOARD COLUMN DETECTION (fix charts)
+# DASHBOARD COLUMN DETECTION + SAFE FALLBACK
 # ============================================================
 def pick_first_existing(df: pd.DataFrame, candidates: list[str]) -> str | None:
     cols_lower = {c.lower(): c for c in df.columns}
@@ -241,11 +261,19 @@ def pick_first_existing(df: pd.DataFrame, candidates: list[str]) -> str | None:
     return None
 
 def get_dashboard_columns(dm: pd.DataFrame):
-    # qty candidates
     qty_col = pick_first_existing(dm, ["Qnt(Bag)", "Qty(Bag)", "Qty", "Qnt", "Quantity"])
-    # edd candidates (by name)
     edd_col = pick_first_existing(dm, ["Earliest Delivery Date", "EDD", "EARLIEST DELIVERY DATE"])
-    return edd_col, qty_col
+    truck_col = pick_first_existing(dm, ["Truck ID/Name", "Truck", "Truck ID"])
+    sku_id_col = pick_first_existing(dm, ["SKU ID", "SKU_ID", "Sku ID"])
+    return edd_col, qty_col, truck_col, sku_id_col
+
+def fallback_by_position(dm: pd.DataFrame):
+    cols = list(dm.columns)
+    edd_col = cols[11] if len(cols) > 11 else None  # L
+    qty_col = cols[3] if len(cols) > 3 else None    # D
+    truck_col = cols[4] if len(cols) > 4 else None  # E
+    sku_id_col = cols[2] if len(cols) > 2 else None # C
+    return edd_col, qty_col, truck_col, sku_id_col
 
 # ============================================================
 # SIDEBAR / NAV + DATE FILTER
@@ -278,12 +306,12 @@ if st.sidebar.button("🔄 Refresh data"):
 # ============================================================
 # LOAD SHEETS
 # ============================================================
-data_main = read_ws("Data Main Sheet")
+data_main = read_ws("Data Main Sheet", header=6)  # headers row 7
 sku_master = read_ws("SKU MASTER")
 truck_lp = read_ws("Truck_LoadPlan", header=6)
 truck_priority = read_ws("Truck_Priority", header=8)
 
-# detect input tab (first sheet) - no sidebar option
+# detect input tab (first sheet)
 try:
     sh = _open_spreadsheet()
     worksheet_titles = [w.title for w in sh.worksheets()]
@@ -291,13 +319,13 @@ try:
 except Exception:
     INPUT_TAB_NAME = ""
 
-# SKU dropdown from SKU MASTER (first col)
+# SKU dropdown from SKU MASTER
 sku_name_options = []
 if not sku_master.empty and sku_master.shape[1] >= 1:
     sku_name_options = [x.strip() for x in sku_master.iloc[:, 0].astype(str).fillna("") if x.strip()]
 
 # ============================================================
-# DASHBOARD (charts fixed)
+# DASHBOARD (hardened: no crashes + charts if possible)
 # ============================================================
 if page == "Dashboard":
     st.title("🚚 Dashboard")
@@ -307,28 +335,73 @@ if page == "Dashboard":
         st.info("Data Main Sheet is empty.")
         st.stop()
 
-    edd_col, qty_col = get_dashboard_columns(dm)
+    edd_col, qty_col, truck_col, sku_id_col = get_dashboard_columns(dm)
+    if not (edd_col and qty_col and truck_col):
+        f_edd, f_qty, f_truck, f_sku = fallback_by_position(dm)
+        edd_col = edd_col or f_edd
+        qty_col = qty_col or f_qty
+        truck_col = truck_col or f_truck
+        sku_id_col = sku_id_col or f_sku
 
-    # Filter by EDD if we found it
-    if edd_col:
+    # Parse EDD safely
+    if edd_col and edd_col in dm.columns:
         dm[edd_col] = pd.to_datetime(dm[edd_col], errors="coerce")
-        dm = dm[(dm[edd_col] >= from_dt) & (dm[edd_col] < to_dt_excl)]
+        dm = dm[(dm[edd_col].notna()) & (dm[edd_col] >= from_dt) & (dm[edd_col] < to_dt_excl)]
 
     if dm.empty:
         st.info("No data found for selected date range.")
         st.stop()
 
+    # Interactive controls (upper portion)
+    with st.container():
+        cA, cB, cC, cD = st.columns([2, 2, 2, 1])
+
+        selected_trucks = []
+        selected_skus = []
+        top_n = 15
+
+        if truck_col and truck_col in dm.columns:
+            all_trucks = sorted([x for x in dm[truck_col].astype(str).unique() if x.strip()])
+            with cA:
+                selected_trucks = st.multiselect("Filter Trucks", all_trucks, default=[])
+
+        if sku_id_col and sku_id_col in dm.columns:
+            all_skus = sorted([x for x in dm[sku_id_col].astype(str).unique() if x.strip()])
+            with cB:
+                selected_skus = st.multiselect("Filter SKU IDs", all_skus, default=[])
+
+        with cC:
+            top_n = st.slider("Top N Trucks (bar chart)", 5, 30, 15)
+
+        with cD:
+            st.write("")
+            st.write("")
+            if st.button("Clear Filters"):
+                st.rerun()
+
+    if truck_col and selected_trucks and truck_col in dm.columns:
+        dm = dm[dm[truck_col].astype(str).isin(selected_trucks)]
+    if sku_id_col and selected_skus and sku_id_col in dm.columns:
+        dm = dm[dm[sku_id_col].astype(str).isin(selected_skus)]
+
+    if dm.empty:
+        st.info("No rows after filters.")
+        st.stop()
+
+    # Qty safe numeric
+    if qty_col and qty_col in dm.columns:
+        dm[qty_col] = pd.to_numeric(dm[qty_col], errors="coerce").fillna(0)
+    else:
+        qty_col = None  # prevent chart errors
+
+    # Metrics
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Rows", f"{len(dm):,}")
-    truck_col = pick_first_existing(dm, ["Truck ID/Name", "Truck", "Truck ID", "Truck ID/Name "])
-    sku_id_col = pick_first_existing(dm, ["SKU ID", "SKU_ID", "Sku ID"])
-
-    if truck_col:
+    if truck_col and truck_col in dm.columns:
         c2.metric("Trucks", f"{dm[truck_col].nunique():,}")
-    if sku_id_col:
+    if sku_id_col and sku_id_col in dm.columns:
         c3.metric("SKUs", f"{dm[sku_id_col].nunique():,}")
     if qty_col:
-        dm[qty_col] = pd.to_numeric(dm[qty_col], errors="coerce").fillna(0)
         c4.metric("Total Bags", f"{dm[qty_col].sum():,.0f}")
 
     st.divider()
@@ -336,25 +409,36 @@ if page == "Dashboard":
 
     with left:
         if edd_col and qty_col:
-            tmp = dm.copy()
+            tmp = dm[[edd_col, qty_col]].copy()
             tmp["EDD_Date"] = tmp[edd_col].dt.date
             daily = tmp.groupby("EDD_Date", as_index=False)[qty_col].sum()
-            st.plotly_chart(px.line(daily, x="EDD_Date", y=qty_col, markers=True), use_container_width=True)
+            if not daily.empty:
+                st.plotly_chart(px.line(daily, x="EDD_Date", y=qty_col, markers=True), use_container_width=True)
+            else:
+                st.info("No daily totals to plot.")
         else:
-            st.info("Line chart needs EDD column (Earliest Delivery Date/EDD) and qty column (Qnt(Bag)/Qty(Bag)).")
+            st.info("Line chart needs EDD + Qty columns.")
 
     with right:
-        if truck_col and qty_col:
-            top = dm.groupby(truck_col, as_index=False)[qty_col].sum().sort_values(qty_col, ascending=False).head(15)
-            st.plotly_chart(px.bar(top, x=truck_col, y=qty_col), use_container_width=True)
+        if truck_col and qty_col and truck_col in dm.columns:
+            top = (
+                dm.groupby(truck_col, as_index=False)[qty_col]
+                .sum()
+                .sort_values(qty_col, ascending=False)
+                .head(top_n)
+            )
+            if not top.empty:
+                st.plotly_chart(px.bar(top, x=truck_col, y=qty_col), use_container_width=True)
+            else:
+                st.info("No truck totals to plot.")
         else:
-            st.info("Bar chart needs Truck column (Truck ID/Name) and qty column (Qnt(Bag)/Qty(Bag)).")
+            st.info("Bar chart needs Truck + Qty columns.")
 
     st.subheader("Filtered Data Preview")
     st.dataframe(dm.head(300), use_container_width=True)
 
 # ============================================================
-# INPUT PAGE (APIError fixed)
+# INPUT PAGE (visual clock picker with AM/PM)
 # ============================================================
 elif page == "Input (Push to Data Main)":
     st.title("Input Sheet")
@@ -368,7 +452,6 @@ elif page == "Input (Push to Data Main)":
     sh_live = _open_spreadsheet()
     ws_input = sh_live.worksheet(INPUT_TAB_NAME)
 
-    # always read current (single API call)
     try:
         current = read_input_form_range(ws_input)
     except Exception as e:
@@ -376,7 +459,6 @@ elif page == "Input (Push to Data Main)":
         st.stop()
 
     st.subheader("Part 1: Input Form")
-    now = datetime.now()
 
     with st.form("input_form"):
         col1, col2 = st.columns(2)
@@ -386,7 +468,21 @@ elif page == "Input (Push to Data Main)":
                 "Delivery Date (B6)",
                 value=pd.to_datetime(current["Delivery Date"], errors="coerce").date() if current["Delivery Date"] else date.today()
             )
-            delivery_time = st.text_input("Delivery Time (B7) - 12 hour", value=(current["Delivery Time"] or fmt_time_12h(now)))
+
+            # ✅ VISUAL clock picker (AM/PM) via st-time-entry; fallback to st.time_input
+            if st_time_entry is not None:
+                delivery_time = normalize_component_time_str(
+                    st_time_entry("Delivery Time (B7)", key="t_delivery")
+                )
+                if not delivery_time:
+                    delivery_time = time_to_12h_str_from_timeobj(datetime.now().time().replace(second=0, microsecond=0))
+            else:
+                delivery_time_obj = st.time_input(
+                    "Delivery Time (B7)",
+                    value=parse_12h_to_time_obj(current["Delivery Time"]),
+                    step=60
+                )
+                delivery_time = time_to_12h_str_from_timeobj(delivery_time_obj)
 
             if not sku_name_options:
                 st.error("SKU MASTER is empty (cannot build dropdown).")
@@ -409,61 +505,75 @@ elif page == "Input (Push to Data Main)":
 
         with col2:
             truck_id = st.text_input("Truck ID/Name (B11)", value=(current["Truck ID/Name"] or ""))
+
             vin_date = st.date_input(
                 "Vehicle Factory In Date (B12)",
                 value=pd.to_datetime(current["Vehicle Factory In Date"], errors="coerce").date() if current["Vehicle Factory In Date"] else date.today()
             )
-            vin_time = st.text_input("Vehicle Factory In Time (B13) - 12 hour", value=(current["Vehicle Factory In Time"] or fmt_time_12h(now)))
+
+            if st_time_entry is not None:
+                vin_time = normalize_component_time_str(
+                    st_time_entry("Vehicle Factory In Time (B13)", key="t_in")
+                )
+                if not vin_time:
+                    vin_time = time_to_12h_str_from_timeobj(datetime.now().time().replace(second=0, microsecond=0))
+            else:
+                vin_time_obj = st.time_input(
+                    "Vehicle Factory In Time (B13)",
+                    value=parse_12h_to_time_obj(current["Vehicle Factory In Time"]),
+                    step=60
+                )
+                vin_time = time_to_12h_str_from_timeobj(vin_time_obj)
+
             vout_date = st.date_input(
                 "Vehicle Factory Out Date (B14)",
                 value=pd.to_datetime(current["Vehicle Factory Out Date"], errors="coerce").date() if current["Vehicle Factory Out Date"] else date.today()
             )
-            vout_time = st.text_input("Vehicle Factory Out Time (B15) - 12 hour", value=(current["Vehicle Factory Out Time"] or fmt_time_12h(now)))
+
+            if st_time_entry is not None:
+                vout_time = normalize_component_time_str(
+                    st_time_entry("Vehicle Factory Out Time (B15)", key="t_out")
+                )
+                if not vout_time:
+                    vout_time = time_to_12h_str_from_timeobj(datetime.now().time().replace(second=0, microsecond=0))
+            else:
+                vout_time_obj = st.time_input(
+                    "Vehicle Factory Out Time (B15)",
+                    value=parse_12h_to_time_obj(current["Vehicle Factory Out Time"]),
+                    step=60
+                )
+                vout_time = time_to_12h_str_from_timeobj(vout_time_obj)
 
         save_btn = st.form_submit_button("✅ Save to Input Sheet")
 
     if save_btn:
-        for label, t in [
-            ("Delivery Time", delivery_time),
-            ("Vehicle Factory In Time", vin_time),
-            ("Vehicle Factory Out Time", vout_time),
-        ]:
-            if re.match(TIME_12H_PATTERN, str(t).strip().upper()) is None:
-                st.error(f"{label} must be like 09:23 PM")
-                st.stop()
-
         if truck_id and re.match(TRUCK_PATTERN, str(truck_id).strip().upper()) is None:
             st.error("Truck ID/Name must be like DM-TA-224564")
             st.stop()
 
         try:
-            # DO NOT touch B9
             updates = {
                 "B6": delivery_date.strftime("%Y-%m-%d"),
-                "B7": str(delivery_time).strip().upper(),
+                "B7": delivery_time,  # 12h string
                 "B8": sku_selected,
                 "B10": int(qty),
                 "B11": str(truck_id).strip().upper(),
                 "B12": vin_date.strftime("%Y-%m-%d"),
-                "B13": str(vin_time).strip().upper(),
+                "B13": vin_time,      # 12h string
                 "B14": vout_date.strftime("%Y-%m-%d"),
-                "B15": str(vout_time).strip().upper(),
+                "B15": vout_time,     # 12h string
             }
             ws_batch_update(ws_input, updates, user_entered=True)
 
-            # wait for B9 formula to compute then reread once
             time.sleep(0.6)
             current = read_input_form_range(ws_input)
-
             st.success("Saved. SKU ID (B9) updated automatically by sheet formula.")
-
         except Exception as e:
             st.error(f"Failed to save: {e}")
 
     st.divider()
     st.subheader("Part 2: Push to Data Main Sheet")
 
-    # live preview (no repeated per-cell API calls)
     try:
         current = read_input_form_range(ws_input)
         preview = pd.DataFrame([{"Field": k, "Value": v} for k, v in current.items()])
@@ -505,8 +615,10 @@ elif page == "Truck_LoadPlan":
 elif page == "Data Main Sheet":
     st.title("📄 Data Main Sheet (Filtered by sidebar date range)")
     dm = data_main.copy()
-    edd_col, _ = get_dashboard_columns(dm)
-    if not dm.empty and edd_col:
+    edd_col, qty_col, truck_col, sku_id_col = get_dashboard_columns(dm)
+    if not edd_col:
+        edd_col = fallback_by_position(dm)[0]
+    if not dm.empty and edd_col and edd_col in dm.columns:
         dm[edd_col] = pd.to_datetime(dm[edd_col], errors="coerce")
         dm = dm[(dm[edd_col] >= from_dt) & (dm[edd_col] < to_dt_excl)]
     q = st.text_input("Search")
@@ -515,23 +627,23 @@ elif page == "Data Main Sheet":
 else:
     st.title("🔢 Sequencing (Row Rank)")
     dm = data_main.copy()
-    edd_col, _ = get_dashboard_columns(dm)
-    if not dm.empty and edd_col:
+    edd_col, qty_col, truck_col, sku_id_col = get_dashboard_columns(dm)
+    if not edd_col:
+        edd_col = fallback_by_position(dm)[0]
+    if not truck_col:
+        truck_col = fallback_by_position(dm)[2]
+    if not dm.empty and edd_col and edd_col in dm.columns:
         dm[edd_col] = pd.to_datetime(dm[edd_col], errors="coerce")
         dm = dm[(dm[edd_col] >= from_dt) & (dm[edd_col] < to_dt_excl)]
     if dm.empty:
         st.info("No rows in selected date range.")
         st.stop()
-
     sort_cols = []
-    if edd_col:
+    if edd_col and edd_col in dm.columns:
         sort_cols.append(edd_col)
-    truck_col = pick_first_existing(dm, ["Truck ID/Name", "Truck", "Truck ID"])
-    if truck_col:
+    if truck_col and truck_col in dm.columns:
         sort_cols.append(truck_col)
-
     if sort_cols:
         dm = dm.sort_values(sort_cols).reset_index(drop=True)
-
     dm.insert(0, "Row Rank", np.arange(1, len(dm) + 1))
     st.dataframe(dm, use_container_width=True)
