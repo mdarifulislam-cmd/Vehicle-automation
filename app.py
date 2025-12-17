@@ -1,3 +1,6 @@
+from streamlit_gsheets import GSheetsConnection
 import streamlit as st
-st.write("keys:", list(st.secrets["connections"]["gsheets"].keys()))
-st.write("service_account keys:", list(st.secrets["connections"]["gsheets"]["service_account"].keys()))
+
+conn = st.connection("gsheets", type=GSheetsConnection)
+df_main = conn.read(worksheet="Data Main Sheet")
+st.dataframe(df_main.head())
