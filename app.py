@@ -181,7 +181,7 @@ def push_selected_rows_to_data_main(input_df_full: pd.DataFrame, selected_rowids
       G = Vehicle Factory In Time
       H = Vehicle Factory Out Date
       I = Vehicle Factory Out Time
-    Only updates these cells. J+ is untouched.
+    Only updates A..I cells. J+ untouched.
     """
     if not selected_rowids:
         return 0, []
@@ -193,7 +193,6 @@ def push_selected_rows_to_data_main(input_df_full: pd.DataFrame, selected_rowids
     end_row = start_row + len(selected_rowids) - 1
     ensure_rows(ws_main, end_row)
 
-    # Ensure required columns exist in input df
     missing = [h for h in INPUT_HEADERS if h not in input_df_full.columns]
     if missing:
         raise ValueError(f"Input sheet missing columns: {missing}")
@@ -205,7 +204,6 @@ def push_selected_rows_to_data_main(input_df_full: pd.DataFrame, selected_rowids
         r_target = start_row + i
         row = input_df_full.loc[rid]
 
-        # Merge delivery datetime into A
         A_val = merge_delivery_datetime(row["Delivery Date"], row["Delivery Time"])
 
         updates = {
@@ -220,9 +218,6 @@ def push_selected_rows_to_data_main(input_df_full: pd.DataFrame, selected_rowids
             f"Data Main Sheet!I{r_target}": str(row["Vehicle Factory Out Time"]).strip().upper(),
         }
 
-        # IMPORTANT: do not write empty strings into critical cells that might trigger sheet behaviors.
-        # But for A..I you want the row filled, so keep as-is. If you prefer skip blanks, tell me.
-
         batch_update_cells(ws_main, updates)
 
         written += 1
@@ -231,9 +226,10 @@ def push_selected_rows_to_data_main(input_df_full: pd.DataFrame, selected_rowids
     return written, wrote_rows
 
 # ============================================================
-# SIDEBAR / NAV
+# SIDEBAR / NAV + DATE FILTER BACK
 # ============================================================
 st.sidebar.title("Truck Sequencing Live")
+
 page = st.sidebar.radio(
     "Menu",
     [
@@ -244,6 +240,12 @@ page = st.sidebar.radio(
         "Data Main Sheet",
     ],
 )
+
+st.sidebar.markdown("### Date Range (Earliest Delivery Date)")
+from_date = st.sidebar.date_input("From", value=date(2025, 12, 12))
+to_date = st.sidebar.date_input("To", value=date(2025, 12, 18))
+from_dt = pd.to_datetime(from_date)
+to_dt_excl = pd.to_datetime(to_date) + pd.Timedelta(days=1)
 
 if st.sidebar.button("🔄 Refresh data"):
     st.cache_data.clear()
@@ -294,11 +296,8 @@ if page == "Input (Push to Data Main)":
         st.error("Input sheet loaded empty. Check tab / permissions / header row.")
         st.stop()
 
-    # -------------------------
-    # PART 1: INPUT FORM (writes B6..B15)
-    # -------------------------
+    # PART 1
     st.subheader("Part 1: Input Form (writes to cells B6–B15)")
-
     now = datetime.now()
 
     with st.form("input_cells_form"):
@@ -324,7 +323,6 @@ if page == "Input (Push to Data Main)":
         save_form = st.form_submit_button("✅ Save to Input Sheet")
 
     if save_form:
-        # Validate time format (12h)
         for label, t in [
             ("Delivery Time", delivery_time),
             ("Vehicle Factory In Time", vin_time),
@@ -334,7 +332,6 @@ if page == "Input (Push to Data Main)":
                 st.error(f"{label} must be like 09:23 PM")
                 st.stop()
 
-        # Validate truck id
         if truck_id and re.match(TRUCK_PATTERN, truck_id.strip().upper()) is None:
             st.error("Truck ID/Name must be like DM-TA-224564")
             st.stop()
@@ -370,15 +367,11 @@ if page == "Input (Push to Data Main)":
 
     st.divider()
 
-    # -------------------------
-    # PART 2: TABLE (A–C view) + PUSH
-    # -------------------------
+    # PART 2
     st.subheader("Part 2: Select rows (A–C view) → Push into Data Main Sheet")
 
-    # Preserve original index so selection maps correctly
     view_df = input_df_full.copy()
     view_df["_ROWID_"] = view_df.index
-
     cols_to_show = list(input_df_full.columns[:3])  # A..C
     view_small = view_df[["_ROWID_"] + cols_to_show]
 
@@ -430,5 +423,14 @@ elif page == "Truck_LoadPlan":
     st.dataframe(truck_lp, use_container_width=True)
 
 else:
-    st.title("📄 Data Main Sheet")
-    st.dataframe(data_main, use_container_width=True)
+    st.title("📄 Data Main Sheet (Filtered by sidebar date range)")
+
+    # Best-effort filtering on "Earliest Delivery Date" if present
+    # If your sheet uses another column name, tell me and I’ll adjust.
+    if not data_main.empty and "Earliest Delivery Date" in data_main.columns:
+        tmp = data_main.copy()
+        tmp["Earliest Delivery Date"] = pd.to_datetime(tmp["Earliest Delivery Date"], errors="coerce")
+        tmp = tmp[(tmp["Earliest Delivery Date"] >= from_dt) & (tmp["Earliest Delivery Date"] < to_dt_excl)]
+        st.dataframe(tmp, use_container_width=True)
+    else:
+        st.dataframe(data_main, use_container_width=True)
