@@ -1,14 +1,11 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
 from datetime import datetime, date
-import plotly.express as px
 import time
 import random
 import re
 
 from streamlit_gsheets import GSheetsConnection
-
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -16,25 +13,11 @@ from google.oauth2.service_account import Credentials
 # CONFIG
 # ============================================================
 st.set_page_config(page_title="Truck Sequencing Live", layout="wide")
-
-# ============================================================
-# CONNECTION (READ)
-# ============================================================
 conn = st.connection("gsheets", type=GSheetsConnection)
 
 # ============================================================
-# HELPERS
+# READ HELPERS
 # ============================================================
-def safe_dt(x):
-    if pd.isna(x):
-        return pd.NaT
-    if isinstance(x, (pd.Timestamp, datetime)):
-        return pd.to_datetime(x)
-    return pd.to_datetime(str(x), errors="coerce")
-
-def to_num(s):
-    return pd.to_numeric(s, errors="coerce").fillna(0)
-
 def table_search(df: pd.DataFrame, q: str) -> pd.DataFrame:
     if df.empty:
         return df
@@ -67,19 +50,56 @@ def read_ws(worksheet: str, header: int | None = None) -> pd.DataFrame:
                 return pd.DataFrame()
             time.sleep((base_sleep * (2 ** i)) + random.uniform(0, 0.3))
 
-def filter_by_edd(df: pd.DataFrame, from_dt: pd.Timestamp, to_dt_excl: pd.Timestamp) -> pd.DataFrame:
-    if df.empty or "Earliest Delivery Date" not in df.columns:
-        return df
-    return df[(df["Earliest Delivery Date"] >= from_dt) & (df["Earliest Delivery Date"] < to_dt_excl)]
+# ============================================================
+# FORMATTING / VALIDATION
+# ============================================================
+def fmt_time_12h(now: datetime) -> str:
+    return now.strftime("%I:%M %p")  # 09:23 PM
 
-def fmt_date(d: date) -> str:
-    return d.strftime("%Y-%m-%d")
+def parse_time_to_hms(t: str):
+    if t is None:
+        return None
+    s = str(t).strip().upper()
+    fmts = ["%I:%M %p", "%I:%M:%S %p", "%H:%M:%S", "%H:%M"]
+    for f in fmts:
+        try:
+            dt = datetime.strptime(s, f)
+            return dt.hour, dt.minute, dt.second
+        except Exception:
+            pass
+    m = re.match(r"^(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)?$", s)
+    if not m:
+        return None
+    h = int(m.group(1))
+    mi = int(m.group(2))
+    se = int(m.group(3) or 0)
+    ap = m.group(4)
+    if ap:
+        if ap == "PM" and h != 12:
+            h += 12
+        if ap == "AM" and h == 12:
+            h = 0
+    return h, mi, se
 
-def fmt_time_12h(dt: datetime) -> str:
-    return dt.strftime("%I:%M %p")  # 09:23 PM
+def merge_delivery_datetime(delivery_date_val, delivery_time_val) -> str:
+    """
+    Output: M/D/YYYY H:MM:SS  (example: 12/1/2025 3:17:00)
+    """
+    d = pd.to_datetime(delivery_date_val, errors="coerce")
+    if pd.isna(d):
+        return ""
+    hms = parse_time_to_hms(delivery_time_val)
+    if not hms:
+        return ""
+    h, mi, se = hms
+    dt = datetime(d.year, d.month, d.day, h, mi, se)
+    return f"{dt.month}/{dt.day}/{dt.year} {dt.hour}:{dt.minute:02d}:{dt.second:02d}"
+
+TIME_12H_PATTERN = r"^(0[1-9]|1[0-2]):[0-5][0-9]\s?(AM|PM)$"
+TRUCK_PATTERN = r"^[A-Z]{2}-[A-Z]{2}-\d{6}$"
 
 # ============================================================
-# WRITE HELPERS (gspread)
+# GSHEET WRITE (gspread)
 # ============================================================
 def _get_gspread_client():
     cfg = st.secrets["connections"]["gsheets"]
@@ -94,7 +114,6 @@ def _get_gspread_client():
         "client_id": sa["client_id"],
         "token_uri": sa.get("token_uri", "https://oauth2.googleapis.com/token"),
     }
-
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
@@ -111,123 +130,132 @@ def _open_spreadsheet():
         return gc.open_by_url(spreadsheet)
     return gc.open_by_key(spreadsheet)
 
-def _colnum_to_letter(n: int) -> str:
-    s = ""
-    while n:
-        n, r = divmod(n - 1, 26)
-        s = chr(65 + r) + s
-    return s
-
-def _first_blank_row_in_colA(ws, start_row=2):
-    """
-    Finds first blank row in column A safely within grid limits.
-    Uses ws.row_count to avoid exceeding sheet row limit.
-    """
+def first_blank_row_colA(ws, start_row=2) -> int:
     max_row = ws.row_count
-    if start_row > max_row:
-        return start_row
-
-    # Read column A values up to max_row (safe)
-    # col_values returns values for existing filled cells (may be shorter)
-    colA = ws.col_values(1)  # 1-based column A
-    # Ensure list has length max_row (pad with empty)
+    colA = ws.col_values(1)
     if len(colA) < max_row:
         colA = colA + [""] * (max_row - len(colA))
-
     for r in range(start_row, max_row + 1):
-        v = colA[r - 1]  # list is 0-based
-        if str(v).strip() == "":
+        if str(colA[r - 1]).strip() == "":
             return r
-
-    # No blanks found inside existing grid -> next row
     return max_row + 1
 
-def _ensure_rows(ws, needed_last_row: int):
-    """
-    If writing would exceed current row_count, add rows first.
-    """
-    if needed_last_row <= ws.row_count:
-        return
-    ws.add_rows(needed_last_row - ws.row_count)
+def ensure_rows(ws, needed_last_row: int):
+    if needed_last_row > ws.row_count:
+        ws.add_rows(needed_last_row - ws.row_count)
 
-def push_input_rows_to_data_main(input_df: pd.DataFrame, selected_idx: list[int]):
+def batch_update_cells(ws, cell_to_value: dict):
     """
-    Writes selected rows into Data Main Sheet starting at first blank row in col A.
-    Auto-expands sheet rows if needed.
-    Header mapping: matches column names from input_df to Data Main headers.
+    Writes ONLY given cells. Does not overwrite formulas in other columns.
     """
-    if not selected_idx:
-        return 0
+    body = {"valueInputOption": "USER_ENTERED", "data": []}
+    for a1, val in cell_to_value.items():
+        body["data"].append({"range": a1, "values": [[val]]})
+    ws.batch_update(body)
+
+# ============================================================
+# PUSH LOGIC (A..I only; J onwards untouched)
+# ============================================================
+INPUT_HEADERS = [
+    "Delivery Date",
+    "Delivery Time",
+    "SKU",
+    "SKU ID",
+    "Enter Quantity",
+    "Truck ID/Name",
+    "Vehicle Factory In Date",
+    "Vehicle Factory In Time",
+    "Vehicle Factory Out Date",
+    "Vehicle Factory Out Time",
+]
+
+def push_selected_rows_to_data_main(input_df_full: pd.DataFrame, selected_rowids: list[int]):
+    """
+    Data Main columns:
+      A = Delivery Date+Time (merged)
+      B = SKU
+      C = SKU ID
+      D = Enter Quantity
+      E = Truck ID/Name
+      F = Vehicle Factory In Date
+      G = Vehicle Factory In Time
+      H = Vehicle Factory Out Date
+      I = Vehicle Factory Out Time
+    Only updates these cells. J+ is untouched.
+    """
+    if not selected_rowids:
+        return 0, []
 
     sh = _open_spreadsheet()
     ws_main = sh.worksheet("Data Main Sheet")
 
-    main_headers = ws_main.row_values(1)
-    if not main_headers:
-        raise ValueError("Data Main Sheet row 1 has no headers.")
+    start_row = first_blank_row_colA(ws_main, start_row=2)
+    end_row = start_row + len(selected_rowids) - 1
+    ensure_rows(ws_main, end_row)
 
-    main_col_count = len(main_headers)
-    last_col_letter = _colnum_to_letter(main_col_count)
+    # Ensure required columns exist in input df
+    missing = [h for h in INPUT_HEADERS if h not in input_df_full.columns]
+    if missing:
+        raise ValueError(f"Input sheet missing columns: {missing}")
 
-    start_row = _first_blank_row_in_colA(ws_main, start_row=2)
+    written = 0
+    wrote_rows = []
 
-    values_to_write = []
-    for ridx in selected_idx:
-        row_series = input_df.iloc[ridx]
-        row_dict = row_series.to_dict()
-        aligned = [row_dict.get(h, "") for h in main_headers]
-        values_to_write.append(aligned)
+    for i, rid in enumerate(selected_rowids):
+        r_target = start_row + i
+        row = input_df_full.loc[rid]
 
-    end_row = start_row + len(values_to_write) - 1
+        # Merge delivery datetime into A
+        A_val = merge_delivery_datetime(row["Delivery Date"], row["Delivery Time"])
 
-    # ✅ Ensure grid has enough rows (fixes your error)
-    _ensure_rows(ws_main, end_row)
+        updates = {
+            f"Data Main Sheet!A{r_target}": A_val,
+            f"Data Main Sheet!B{r_target}": str(row["SKU"]).strip(),
+            f"Data Main Sheet!C{r_target}": str(row["SKU ID"]).strip(),
+            f"Data Main Sheet!D{r_target}": row["Enter Quantity"],
+            f"Data Main Sheet!E{r_target}": str(row["Truck ID/Name"]).strip(),
+            f"Data Main Sheet!F{r_target}": str(row["Vehicle Factory In Date"]).strip(),
+            f"Data Main Sheet!G{r_target}": str(row["Vehicle Factory In Time"]).strip().upper(),
+            f"Data Main Sheet!H{r_target}": str(row["Vehicle Factory Out Date"]).strip(),
+            f"Data Main Sheet!I{r_target}": str(row["Vehicle Factory Out Time"]).strip().upper(),
+        }
 
-    target_range = f"A{start_row}:{last_col_letter}{end_row}"
-    ws_main.update(target_range, values_to_write)
-    return len(values_to_write)
+        # IMPORTANT: do not write empty strings into critical cells that might trigger sheet behaviors.
+        # But for A..I you want the row filled, so keep as-is. If you prefer skip blanks, tell me.
+
+        batch_update_cells(ws_main, updates)
+
+        written += 1
+        wrote_rows.append(r_target)
+
+    return written, wrote_rows
 
 # ============================================================
-# SIDEBAR
+# SIDEBAR / NAV
 # ============================================================
 st.sidebar.title("Truck Sequencing Live")
-
 page = st.sidebar.radio(
     "Menu",
     [
-        "Dashboard",
         "Input (Push to Data Main)",
         "Truck_Priority",
         "SKU MASTER",
         "Truck_LoadPlan",
         "Data Main Sheet",
-        "Sequencing (Row Rank)",
     ],
 )
-
-st.sidebar.markdown("### Date Range (Earliest Delivery Date)")
-from_date = st.sidebar.date_input("From", value=date(2025, 12, 12))
-to_date = st.sidebar.date_input("To", value=date(2025, 12, 18))
-from_dt = pd.to_datetime(from_date)
-to_dt_excl = pd.to_datetime(to_date) + pd.Timedelta(days=1)
 
 if st.sidebar.button("🔄 Refresh data"):
     st.cache_data.clear()
     st.rerun()
 
 # ============================================================
-# LOAD SHEETS (READ)
+# LOAD SHEETS
 # ============================================================
 data_main = read_ws("Data Main Sheet")
 sku_master = read_ws("SKU MASTER")
 truck_lp = read_ws("Truck_LoadPlan", header=6)        # headers row 7
 truck_priority = read_ws("Truck_Priority", header=8)  # headers row 9
-
-# Normalize main
-if not data_main.empty and "Earliest Delivery Date" in data_main.columns:
-    data_main["Earliest Delivery Date"] = data_main["Earliest Delivery Date"].apply(safe_dt)
-if "Qnt(Bag)" in data_main.columns:
-    data_main["Qnt(Bag)"] = to_num(data_main["Qnt(Bag)"])
 
 # Detect FIRST worksheet name via gspread
 try:
@@ -237,134 +265,103 @@ try:
 except Exception:
     FIRST_SHEET_NAME = None
 
-# Read FIRST sheet with headers row 5 => header index = 4
-input_sheet_df = read_ws(FIRST_SHEET_NAME, header=4) if FIRST_SHEET_NAME else pd.DataFrame()
+# Input sheet headers row = 5 => header=4
+input_df_full = read_ws(FIRST_SHEET_NAME, header=4) if FIRST_SHEET_NAME else pd.DataFrame()
 
-# SKU dropdown options from SKU MASTER column A, ID from column B
+# SKU dropdown options
 sku_name_options = []
 sku_id_lookup = {}
 if not sku_master.empty and sku_master.shape[1] >= 2:
-    sku_names = sku_master.iloc[:, 0].astype(str).fillna("").tolist()
-    sku_ids = sku_master.iloc[:, 1].astype(str).fillna("").tolist()
-    for n, sid in zip(sku_names, sku_ids):
+    for n, sid in zip(sku_master.iloc[:, 0].astype(str), sku_master.iloc[:, 1].astype(str)):
         n2 = n.strip()
         if n2:
             sku_name_options.append(n2)
             sku_id_lookup[n2] = sid.strip()
 
 # ============================================================
-# PAGE: DASHBOARD
+# PAGES
 # ============================================================
-if page == "Dashboard":
-    st.title("🚚 Dashboard")
-
-    df = filter_by_edd(data_main, from_dt, to_dt_excl)
-    if df.empty:
-        st.info("No data found in selected date range.")
-        st.stop()
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Rows", f"{len(df):,}")
-    if "Truck ID/Name" in df.columns:
-        c2.metric("Trucks", df["Truck ID/Name"].nunique())
-    if "SKU ID" in df.columns:
-        c3.metric("SKUs", df["SKU ID"].nunique())
-    if "Qnt(Bag)" in df.columns:
-        c4.metric("Total Bags", f"{df['Qnt(Bag)'].sum():,.0f}")
-
-    st.divider()
-
-    left, right = st.columns(2)
-    with left:
-        if "Earliest Delivery Date" in df.columns and "Qnt(Bag)" in df.columns:
-            tmp = df.copy()
-            tmp["EDD_Date"] = tmp["Earliest Delivery Date"].dt.date
-            daily = tmp.groupby("EDD_Date", as_index=False)["Qnt(Bag)"].sum()
-            st.plotly_chart(px.line(daily, x="EDD_Date", y="Qnt(Bag)", markers=True), use_container_width=True)
-
-    with right:
-        if "Truck ID/Name" in df.columns and "Qnt(Bag)" in df.columns:
-            top = df.groupby("Truck ID/Name", as_index=False)["Qnt(Bag)"].sum().sort_values("Qnt(Bag)", ascending=False).head(15)
-            st.plotly_chart(px.bar(top, x="Truck ID/Name", y="Qnt(Bag)"), use_container_width=True)
-
-    st.subheader("Filtered Data")
-    q = st.text_input("Search")
-    st.dataframe(table_search(df, q), use_container_width=True)
-
-# ============================================================
-# PAGE: INPUT (2 PARTS)
-# ============================================================
-elif page == "Input (Push to Data Main)":
+if page == "Input (Push to Data Main)":
     st.title("Input Sheet")
 
     if not FIRST_SHEET_NAME:
-        st.error("Could not detect the first worksheet name.")
+        st.error("Could not detect your first worksheet (Input sheet).")
         st.stop()
 
-    st.caption(f"Detected 1st tab: **{FIRST_SHEET_NAME}** (Headers row = 5)")
+    st.caption(f"Connected Input Sheet tab: **{FIRST_SHEET_NAME}** (headers row = 5)")
+
+    if input_df_full.empty:
+        st.error("Input sheet loaded empty. Check tab / permissions / header row.")
+        st.stop()
 
     # -------------------------
-    # PART 1: FORM (B6..B15)
+    # PART 1: INPUT FORM (writes B6..B15)
     # -------------------------
-    st.subheader("Part 1: Create Input (writes to cells B6–B15)")
+    st.subheader("Part 1: Input Form (writes to cells B6–B15)")
 
     now = datetime.now()
 
     with st.form("input_cells_form"):
-        col1, col2 = st.columns(2)
+        c1, c2 = st.columns(2)
 
-        with col1:
+        with c1:
             delivery_date = st.date_input("Delivery Date (B6)", value=date.today())
-            delivery_time = st.text_input("Delivery Time (B7) - 12h (e.g. 09:23 PM)", value=fmt_time_12h(now))
+            delivery_time = st.text_input("Delivery Time (B7) - 12 hour (e.g. 09:23 PM)", value=fmt_time_12h(now))
 
             sku_name = st.selectbox("SKU (B8)", options=sku_name_options) if sku_name_options else st.text_input("SKU (B8)", "")
             sku_id_auto = sku_id_lookup.get(sku_name, "")
-            st.text_input("SKU ID (B9) - Auto", value=sku_id_auto, disabled=True)
+            st.text_input("SKU ID (B9) - Auto (formula)", value=sku_id_auto, disabled=True)
 
             qty = st.number_input("Enter Quantity (B10)", min_value=0, step=1)
 
-        with col2:
+        with c2:
             truck_id = st.text_input("Truck ID/Name (B11) e.g. DM-TA-224564", value="")
             vin_date = st.date_input("Vehicle Factory In Date (B12)", value=date.today())
-            vin_time = st.text_input("Vehicle Factory In Time (B13) - 12h", value=fmt_time_12h(now))
+            vin_time = st.text_input("Vehicle Factory In Time (B13) - 12 hour", value=fmt_time_12h(now))
             vout_date = st.date_input("Vehicle Factory Out Date (B14)", value=date.today())
-            vout_time = st.text_input("Vehicle Factory Out Time (B15) - 12h", value=fmt_time_12h(now))
+            vout_time = st.text_input("Vehicle Factory Out Time (B15) - 12 hour", value=fmt_time_12h(now))
 
-        submitted = st.form_submit_button("✅ Save Input")
+        save_form = st.form_submit_button("✅ Save to Input Sheet")
 
-    if submitted:
-        truck_pattern = r"^[A-Z]{2}-[A-Z]{2}-\d{6}$"
-        if truck_id and (re.match(truck_pattern, truck_id.strip().upper()) is None):
-            st.error("Truck ID/Name must be like: DM-TA-224564 (2 letters - 2 letters - 6 digits).")
-            st.stop()
-
-        time_pattern = r"^(0[1-9]|1[0-2]):[0-5][0-9]\s?(AM|PM)$"
-        for label, t in [("Delivery Time", delivery_time), ("Vehicle Factory In Time", vin_time), ("Vehicle Factory Out Time", vout_time)]:
-            if re.match(time_pattern, t.strip().upper()) is None:
-                st.error(f"{label} must be like: 09:23 PM")
+    if save_form:
+        # Validate time format (12h)
+        for label, t in [
+            ("Delivery Time", delivery_time),
+            ("Vehicle Factory In Time", vin_time),
+            ("Vehicle Factory Out Time", vout_time),
+        ]:
+            if re.match(TIME_12H_PATTERN, str(t).strip().upper()) is None:
+                st.error(f"{label} must be like 09:23 PM")
                 st.stop()
+
+        # Validate truck id
+        if truck_id and re.match(TRUCK_PATTERN, truck_id.strip().upper()) is None:
+            st.error("Truck ID/Name must be like DM-TA-224564")
+            st.stop()
 
         try:
             sh2 = _open_spreadsheet()
             ws_input = sh2.worksheet(FIRST_SHEET_NAME)
 
+            # Do NOT touch B9
             updates = {
-                "B6": fmt_date(delivery_date),
-                "B7": delivery_time.strip().upper(),
-                "B8": sku_name,
-                # B9 is formula -> DO NOT WRITE
-                "B10": int(qty),
-                "B11": truck_id.strip().upper(),
-                "B12": fmt_date(vin_date),
-                "B13": vin_time.strip().upper(),
-                "B14": fmt_date(vout_date),
-                "B15": vout_time.strip().upper(),
+                f"{FIRST_SHEET_NAME}!B6": delivery_date.strftime("%Y-%m-%d"),
+                f"{FIRST_SHEET_NAME}!B7": delivery_time.strip().upper(),
+                f"{FIRST_SHEET_NAME}!B8": sku_name,
+                f"{FIRST_SHEET_NAME}!B10": int(qty),
+                f"{FIRST_SHEET_NAME}!B11": truck_id.strip().upper(),
+                f"{FIRST_SHEET_NAME}!B12": vin_date.strftime("%Y-%m-%d"),
+                f"{FIRST_SHEET_NAME}!B13": vin_time.strip().upper(),
+                f"{FIRST_SHEET_NAME}!B14": vout_date.strftime("%Y-%m-%d"),
+                f"{FIRST_SHEET_NAME}!B15": vout_time.strip().upper(),
             }
 
-            for cell, val in updates.items():
-                ws_input.update_acell(cell, val)
+            body = {"valueInputOption": "USER_ENTERED", "data": []}
+            for rng, val in updates.items():
+                body["data"].append({"range": rng, "values": [[val]]})
 
-            st.success("Saved to Input Sheet cells! (SKU ID will auto-calc in B9).")
+            ws_input.batch_update(body)
+            st.success("Saved to Input sheet cells B6–B15 (B9 remains formula).")
             st.cache_data.clear()
             st.rerun()
 
@@ -374,95 +371,64 @@ elif page == "Input (Push to Data Main)":
     st.divider()
 
     # -------------------------
-    # PART 2: TABLE (A..C) + PUSH
+    # PART 2: TABLE (A–C view) + PUSH
     # -------------------------
-    st.subheader("Part 2: Input Table (A–C) → Push to Data Main Sheet")
+    st.subheader("Part 2: Select rows (A–C view) → Push into Data Main Sheet")
 
-    if input_sheet_df.empty:
-        st.info("Input sheet is empty or could not be read.")
-        st.stop()
+    # Preserve original index so selection maps correctly
+    view_df = input_df_full.copy()
+    view_df["_ROWID_"] = view_df.index
 
-    input_subset = input_sheet_df.iloc[:, 0:3] if input_sheet_df.shape[1] >= 3 else input_sheet_df
+    cols_to_show = list(input_df_full.columns[:3])  # A..C
+    view_small = view_df[["_ROWID_"] + cols_to_show]
 
     q = st.text_input("Search Input Table (A–C)")
-    view = table_search(input_subset, q).reset_index(drop=True)
+    view_small = table_search(view_small, q).reset_index(drop=True)
 
-    view2 = view.copy()
-    view2.insert(0, "✅ Push?", False)
+    view_small.insert(0, "✅ Push?", False)
 
-    edited = st.data_editor(view2, use_container_width=True, num_rows="dynamic", key="input_editor")
+    edited = st.data_editor(
+        view_small,
+        use_container_width=True,
+        num_rows="dynamic",
+        key="input_table_editor",
+        column_config={"_ROWID_": st.column_config.NumberColumn("_ROWID_", disabled=True)},
+    )
 
     if st.button("🚀 Push Selected Rows to Data Main"):
-        selected_mask = edited["✅ Push?"] == True
-        if selected_mask.sum() == 0:
+        selected = edited[edited["✅ Push?"] == True]
+        if selected.empty:
             st.warning("No rows selected.")
         else:
-            selected_idx = edited.index[selected_mask].tolist()
+            selected_rowids = selected["_ROWID_"].astype(int).tolist()
             try:
-                pushed_count = push_input_rows_to_data_main(view, selected_idx)
-                st.success(f"Pushed {pushed_count} row(s) into Data Main Sheet (starts at first blank row in col A).")
+                pushed, wrote_rows = push_selected_rows_to_data_main(input_df_full, selected_rowids)
+                st.success(f"Pushed {pushed} row(s) into Data Main. Rows written: {wrote_rows} (should start at 362).")
                 st.cache_data.clear()
                 st.rerun()
             except Exception as e:
                 st.error(f"Failed to push rows: {e}")
 
-# ============================================================
-# PAGE: TRUCK PRIORITY (G-K)
-# ============================================================
 elif page == "Truck_Priority":
-    st.title("⭐ Truck_Priority (Real Sequencing)")
+    st.title("⭐ Truck_Priority (G–K only)")
     if truck_priority.empty:
         st.info("Truck_Priority sheet is empty or not found.")
         st.stop()
     subset = truck_priority.iloc[:, 6:11] if truck_priority.shape[1] >= 11 else truck_priority
-    q = st.text_input("Search Truck_Priority (G–K)")
-    st.dataframe(table_search(subset, q), use_container_width=True)
+    st.dataframe(subset, use_container_width=True)
 
-# ============================================================
-# PAGE: SKU MASTER (A-E)
-# ============================================================
 elif page == "SKU MASTER":
-    st.title("📦 SKU MASTER")
+    st.title("📦 SKU MASTER (A–E only)")
     if sku_master.empty:
-        st.info("SKU MASTER is empty or not found.")
+        st.info("SKU MASTER sheet is empty or not found.")
         st.stop()
     subset = sku_master.iloc[:, 0:5] if sku_master.shape[1] >= 5 else sku_master
-    q = st.text_input("Search SKU MASTER (A–E)")
-    st.dataframe(table_search(subset, q), use_container_width=True)
+    st.dataframe(subset, use_container_width=True)
 
-# ============================================================
-# PAGE: TRUCK LOADPLAN (VIEW ONLY)
-# ============================================================
 elif page == "Truck_LoadPlan":
     st.title("🧾 Truck_LoadPlan (View only)")
     st.dataframe(truck_lp, use_container_width=True)
 
-# ============================================================
-# PAGE: DATA MAIN SHEET
-# ============================================================
-elif page == "Data Main Sheet":
-    st.title("📄 Data Main Sheet")
-    df = filter_by_edd(data_main, from_dt, to_dt_excl)
-    q = st.text_input("Search Data Main Sheet")
-    st.dataframe(table_search(df, q), use_container_width=True)
-
-# ============================================================
-# PAGE: SEQUENCING (ROW RANK)
-# ============================================================
 else:
-    st.title("🔢 Sequencing (Row Rank by EDD)")
-
-    df = filter_by_edd(data_main, from_dt, to_dt_excl)
-    if df.empty:
-        st.info("No rows in selected range.")
-        st.stop()
-
-    if "Truck ID/Name" not in df.columns or "Earliest Delivery Date" not in df.columns:
-        st.error("Data Main Sheet must include 'Truck ID/Name' and 'Earliest Delivery Date'.")
-        st.stop()
-
-    ranked = df.sort_values(["Earliest Delivery Date", "Truck ID/Name"], ascending=[True, True]).reset_index(drop=True)
-    ranked["Row Rank"] = np.arange(1, len(ranked) + 1)
-
-    q = st.text_input("Search ranked data")
-    st.dataframe(table_search(ranked, q), use_container_width=True)
+    st.title("📄 Data Main Sheet")
+    st.dataframe(data_main, use_container_width=True)
