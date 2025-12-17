@@ -8,7 +8,6 @@ import random
 import re
 
 from streamlit_gsheets import GSheetsConnection
-
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -72,11 +71,77 @@ def filter_by_edd(df: pd.DataFrame, from_dt: pd.Timestamp, to_dt_excl: pd.Timest
         return df
     return df[(df["Earliest Delivery Date"] >= from_dt) & (df["Earliest Delivery Date"] < to_dt_excl)]
 
-def fmt_date(d: date) -> str:
+def fmt_date_iso(d: date) -> str:
     return d.strftime("%Y-%m-%d")
 
 def fmt_time_12h(dt: datetime) -> str:
     return dt.strftime("%I:%M %p")  # 09:23 PM
+
+def parse_time_to_hms(t: str):
+    """
+    Accepts:
+    - 09:23 PM
+    - 09:23:00 PM
+    - 3:17 PM
+    - 3:17:00
+    - 15:17:00
+    Returns (hour, minute, second)
+    """
+    if t is None:
+        return None
+    s = str(t).strip().upper()
+
+    # Try common formats
+    fmts = [
+        "%I:%M %p",
+        "%I:%M:%S %p",
+        "%I:%M%p",
+        "%I:%M:%S%p",
+        "%H:%M:%S",
+        "%H:%M",
+    ]
+    for f in fmts:
+        try:
+            dt = datetime.strptime(s, f)
+            return dt.hour, dt.minute, dt.second
+        except Exception:
+            pass
+
+    # Last resort: extract numbers
+    m = re.match(r"^(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)?$", s)
+    if not m:
+        return None
+    h = int(m.group(1))
+    mi = int(m.group(2))
+    se = int(m.group(3) or 0)
+    ap = m.group(4)
+    if ap:
+        if ap == "PM" and h != 12:
+            h += 12
+        if ap == "AM" and h == 12:
+            h = 0
+    return h, mi, se
+
+def merge_delivery_datetime(delivery_date_val, delivery_time_val) -> str:
+    """
+    Output exactly like: 12/1/2025 3:17:00
+    """
+    if delivery_date_val in (None, "", pd.NaT) or delivery_time_val in (None, "", pd.NaT):
+        return ""
+
+    d = pd.to_datetime(delivery_date_val, errors="coerce")
+    if pd.isna(d):
+        return ""
+
+    hms = parse_time_to_hms(delivery_time_val)
+    if not hms:
+        return ""
+
+    h, mi, se = hms
+    dt = datetime(d.year, d.month, d.day, h, mi, se)
+
+    # No leading zeros on month/day/hour like your example
+    return f"{dt.month}/{dt.day}/{dt.year} {dt.hour}:{dt.minute:02d}:{dt.second:02d}"
 
 # ============================================================
 # WRITE HELPERS (gspread)
@@ -111,50 +176,30 @@ def _open_spreadsheet():
         return gc.open_by_url(spreadsheet)
     return gc.open_by_key(spreadsheet)
 
-def _colnum_to_letter(n: int) -> str:
-    s = ""
-    while n:
-        n, r = divmod(n - 1, 26)
-        s = chr(65 + r) + s
-    return s
-
 def _first_blank_row_in_colA(ws, start_row=2):
     """
-    Finds first blank row in column A safely within grid limits.
-    Uses ws.row_count to avoid exceeding sheet row limit.
+    Safe within current grid size.
     """
     max_row = ws.row_count
-    if start_row > max_row:
-        return start_row
-
-    # Read column A values up to max_row (safe)
-    # col_values returns values for existing filled cells (may be shorter)
-    colA = ws.col_values(1)  # 1-based column A
-    # Ensure list has length max_row (pad with empty)
+    colA = ws.col_values(1)
     if len(colA) < max_row:
         colA = colA + [""] * (max_row - len(colA))
 
     for r in range(start_row, max_row + 1):
-        v = colA[r - 1]  # list is 0-based
-        if str(v).strip() == "":
+        if str(colA[r - 1]).strip() == "":
             return r
 
-    # No blanks found inside existing grid -> next row
     return max_row + 1
 
 def _ensure_rows(ws, needed_last_row: int):
-    """
-    If writing would exceed current row_count, add rows first.
-    """
     if needed_last_row <= ws.row_count:
         return
     ws.add_rows(needed_last_row - ws.row_count)
 
-def push_input_rows_to_data_main(input_df: pd.DataFrame, selected_idx: list[int]):
+def push_input_rows_to_data_main_only_A_to_I(input_df: pd.DataFrame, selected_idx: list[int]):
     """
-    Writes selected rows into Data Main Sheet starting at first blank row in col A.
-    Auto-expands sheet rows if needed.
-    Header mapping: matches column names from input_df to Data Main headers.
+    ✅ Writes ONLY columns A:I (to protect formulas in other columns).
+    ✅ Merges Delivery Date + Delivery Time into column A (datetime string).
     """
     if not selected_idx:
         return 0
@@ -162,12 +207,14 @@ def push_input_rows_to_data_main(input_df: pd.DataFrame, selected_idx: list[int]
     sh = _open_spreadsheet()
     ws_main = sh.worksheet("Data Main Sheet")
 
+    # Read headers from row 1 (full), but we only write A..I
     main_headers = ws_main.row_values(1)
     if not main_headers:
         raise ValueError("Data Main Sheet row 1 has no headers.")
 
-    main_col_count = len(main_headers)
-    last_col_letter = _colnum_to_letter(main_col_count)
+    main_headers_ai = main_headers[:9]  # A..I
+    if len(main_headers_ai) < 9:
+        raise ValueError("Data Main Sheet must have at least 9 columns (A to I).")
 
     start_row = _first_blank_row_in_colA(ws_main, start_row=2)
 
@@ -175,15 +222,38 @@ def push_input_rows_to_data_main(input_df: pd.DataFrame, selected_idx: list[int]
     for ridx in selected_idx:
         row_series = input_df.iloc[ridx]
         row_dict = row_series.to_dict()
-        aligned = [row_dict.get(h, "") for h in main_headers]
+
+        # Find delivery date/time keys from the row (case-insensitive)
+        # Expected column names in input sheet table: "Delivery Date", "Delivery Time"
+        # but this will also tolerate slight variations.
+        dd_key = None
+        dt_key = None
+        for k in row_dict.keys():
+            lk = str(k).strip().lower()
+            if lk == "delivery date":
+                dd_key = k
+            if lk == "delivery time":
+                dt_key = k
+
+        # Build A..I aligned row
+        aligned = []
+        for i, h in enumerate(main_headers_ai):
+            val = row_dict.get(h, "")
+
+            # Column A override: merged datetime from Delivery Date+Time (if available)
+            if i == 0 and dd_key and dt_key:
+                merged = merge_delivery_datetime(row_dict.get(dd_key, ""), row_dict.get(dt_key, ""))
+                val = merged if merged else val
+
+            aligned.append(val)
+
         values_to_write.append(aligned)
 
     end_row = start_row + len(values_to_write) - 1
-
-    # ✅ Ensure grid has enough rows (fixes your error)
     _ensure_rows(ws_main, end_row)
 
-    target_range = f"A{start_row}:{last_col_letter}{end_row}"
+    # ✅ Write only A..I
+    target_range = f"A{start_row}:I{end_row}"
     ws_main.update(target_range, values_to_write)
     return len(values_to_write)
 
@@ -303,85 +373,14 @@ elif page == "Input (Push to Data Main)":
 
     st.caption(f"Detected 1st tab: **{FIRST_SHEET_NAME}** (Headers row = 5)")
 
-    # -------------------------
-    # PART 1: FORM (B6..B15)
-    # -------------------------
-    st.subheader("Part 1: Create Input (writes to cells B6–B15)")
-
-    now = datetime.now()
-
-    with st.form("input_cells_form"):
-        col1, col2 = st.columns(2)
-
-        with col1:
-            delivery_date = st.date_input("Delivery Date (B6)", value=date.today())
-            delivery_time = st.text_input("Delivery Time (B7) - 12h (e.g. 09:23 PM)", value=fmt_time_12h(now))
-
-            sku_name = st.selectbox("SKU (B8)", options=sku_name_options) if sku_name_options else st.text_input("SKU (B8)", "")
-            sku_id_auto = sku_id_lookup.get(sku_name, "")
-            st.text_input("SKU ID (B9) - Auto", value=sku_id_auto, disabled=True)
-
-            qty = st.number_input("Enter Quantity (B10)", min_value=0, step=1)
-
-        with col2:
-            truck_id = st.text_input("Truck ID/Name (B11) e.g. DM-TA-224564", value="")
-            vin_date = st.date_input("Vehicle Factory In Date (B12)", value=date.today())
-            vin_time = st.text_input("Vehicle Factory In Time (B13) - 12h", value=fmt_time_12h(now))
-            vout_date = st.date_input("Vehicle Factory Out Date (B14)", value=date.today())
-            vout_time = st.text_input("Vehicle Factory Out Time (B15) - 12h", value=fmt_time_12h(now))
-
-        submitted = st.form_submit_button("✅ Save Input")
-
-    if submitted:
-        truck_pattern = r"^[A-Z]{2}-[A-Z]{2}-\d{6}$"
-        if truck_id and (re.match(truck_pattern, truck_id.strip().upper()) is None):
-            st.error("Truck ID/Name must be like: DM-TA-224564 (2 letters - 2 letters - 6 digits).")
-            st.stop()
-
-        time_pattern = r"^(0[1-9]|1[0-2]):[0-5][0-9]\s?(AM|PM)$"
-        for label, t in [("Delivery Time", delivery_time), ("Vehicle Factory In Time", vin_time), ("Vehicle Factory Out Time", vout_time)]:
-            if re.match(time_pattern, t.strip().upper()) is None:
-                st.error(f"{label} must be like: 09:23 PM")
-                st.stop()
-
-        try:
-            sh2 = _open_spreadsheet()
-            ws_input = sh2.worksheet(FIRST_SHEET_NAME)
-
-            updates = {
-                "B6": fmt_date(delivery_date),
-                "B7": delivery_time.strip().upper(),
-                "B8": sku_name,
-                # B9 is formula -> DO NOT WRITE
-                "B10": int(qty),
-                "B11": truck_id.strip().upper(),
-                "B12": fmt_date(vin_date),
-                "B13": vin_time.strip().upper(),
-                "B14": fmt_date(vout_date),
-                "B15": vout_time.strip().upper(),
-            }
-
-            for cell, val in updates.items():
-                ws_input.update_acell(cell, val)
-
-            st.success("Saved to Input Sheet cells! (SKU ID will auto-calc in B9).")
-            st.cache_data.clear()
-            st.rerun()
-
-        except Exception as e:
-            st.error(f"Failed to write input cells: {e}")
-
-    st.divider()
-
-    # -------------------------
-    # PART 2: TABLE (A..C) + PUSH
-    # -------------------------
+    # PART 2 (Table + push) is what affects Data Main, so we fix pushing here.
     st.subheader("Part 2: Input Table (A–C) → Push to Data Main Sheet")
 
     if input_sheet_df.empty:
         st.info("Input sheet is empty or could not be read.")
         st.stop()
 
+    # Show only A..C
     input_subset = input_sheet_df.iloc[:, 0:3] if input_sheet_df.shape[1] >= 3 else input_sheet_df
 
     q = st.text_input("Search Input Table (A–C)")
@@ -399,8 +398,8 @@ elif page == "Input (Push to Data Main)":
         else:
             selected_idx = edited.index[selected_mask].tolist()
             try:
-                pushed_count = push_input_rows_to_data_main(view, selected_idx)
-                st.success(f"Pushed {pushed_count} row(s) into Data Main Sheet (starts at first blank row in col A).")
+                pushed_count = push_input_rows_to_data_main_only_A_to_I(view, selected_idx)
+                st.success(f"Pushed {pushed_count} row(s) into Data Main Sheet (ONLY columns A:I; formulas stay safe).")
                 st.cache_data.clear()
                 st.rerun()
             except Exception as e:
