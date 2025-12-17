@@ -46,11 +46,19 @@ def normalize_main(df: pd.DataFrame) -> pd.DataFrame:
         return df
     if "Earliest Delivery Date" in df.columns:
         df["Earliest Delivery Date"] = df["Earliest Delivery Date"].apply(safe_dt)
-    # Common numeric columns
     for col in ["Qnt(Bag)", "Qty", "Quantity", "Qnt"]:
         if col in df.columns:
             df[col] = to_num(df[col])
     return df
+
+def table_search(df: pd.DataFrame, q: str) -> pd.DataFrame:
+    if df.empty or not q.strip():
+        return df
+    q = q.strip().lower()
+    mask = pd.Series(False, index=df.index)
+    for c in df.columns:
+        mask = mask | df[c].astype(str).str.lower().str.contains(q, na=False)
+    return df[mask]
 
 # -----------------------------
 # Sidebar controls
@@ -59,7 +67,7 @@ st.sidebar.title("Truck Sequencing Live")
 
 page = st.sidebar.radio(
     "Menu",
-    ["Dashboard", "Truck_LoadPlan", "Sequencing (Row Rank)", "SKU MASTER", "Data Main Sheet"]
+    ["Dashboard", "Truck_LoadPlan", "Truck_Priority", "Sequencing (Row Rank)", "SKU MASTER", "Data Main Sheet"]
 )
 
 st.sidebar.markdown("### Date Range (Earliest Delivery Date)")
@@ -78,23 +86,16 @@ refresh = st.sidebar.button("🔄 Refresh Now")
 # -----------------------------
 ttl_main = 0 if refresh else 10
 ttl_lp = 0 if refresh else 10
+ttl_tp = 0 if refresh else 10
 
 data_main = normalize_main(read_ws("Data Main Sheet", ttl=ttl_main))
 sku_master = read_ws("SKU MASTER", ttl=60)
+
 # Truck_LoadPlan headers are on row 7 => header index = 6
 truck_lp = read_ws("Truck_LoadPlan", ttl=ttl_lp, header=6)
 
-# -----------------------------
-# Global search filter helper
-# -----------------------------
-def table_search(df: pd.DataFrame, q: str) -> pd.DataFrame:
-    if df.empty or not q.strip():
-        return df
-    q = q.strip().lower()
-    mask = pd.Series(False, index=df.index)
-    for c in df.columns:
-        mask = mask | df[c].astype(str).str.lower().str.contains(q, na=False)
-    return df[mask]
+# Truck_Priority headers are on row 9 => header index = 8
+truck_priority = read_ws("Truck_Priority", ttl=ttl_tp, header=8)
 
 # ============================================================
 # PAGE: DASHBOARD
@@ -107,7 +108,6 @@ if page == "Dashboard":
         st.info("No rows found in Data Main Sheet for the selected date range.")
         st.stop()
 
-    # KPIs
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Rows (range)", f"{len(df):,}")
 
@@ -120,7 +120,6 @@ if page == "Dashboard":
 
     st.divider()
 
-    # Charts
     left, right = st.columns([1, 1])
 
     with left:
@@ -139,12 +138,10 @@ if page == "Dashboard":
 
     st.divider()
 
-    # Searchable table
     st.subheader("Live Data (Filtered)")
     q = st.text_input("Search in table (truck / sku / anything)")
     st.dataframe(table_search(df, q), use_container_width=True)
 
-    # Download filtered
     st.download_button(
         "⬇️ Download filtered CSV",
         data=table_search(df, q).to_csv(index=False).encode("utf-8"),
@@ -157,16 +154,12 @@ if page == "Dashboard":
 # ============================================================
 elif page == "Truck_LoadPlan":
     st.title("🧾 Truck_LoadPlan (Live)")
-
     st.caption("Headers are on row 7 in Google Sheets (we read using header=6).")
 
-    # Show current table
     st.subheader("Current Truck_LoadPlan")
     st.dataframe(truck_lp, use_container_width=True)
 
     st.divider()
-
-    # Add new row
     st.subheader("Add new LoadPlan row")
 
     col1, col2 = st.columns([1, 1])
@@ -211,16 +204,42 @@ elif page == "Truck_LoadPlan":
                     st.error(f"CSV must contain columns: {', '.join(sorted(required))}")
                 else:
                     if st.button("⬆️ Append CSV rows to Truck_LoadPlan"):
-                        # Ensure all expected columns exist
                         for c in ["SKU NAME", "Truck Rank", "Line Score"]:
                             if c not in dfu.columns:
                                 dfu[c] = ""
                         dfu["SavedAt"] = datetime.now().isoformat(timespec="seconds")
-                        append_rows("Truck_LoadPlan", dfu[["Truck ID/Name","SKU_ID","Qty","SKU NAME","Truck Rank","Line Score","SavedAt"]])
+                        append_rows(
+                            "Truck_LoadPlan",
+                            dfu[["Truck ID/Name","SKU_ID","Qty","SKU NAME","Truck Rank","Line Score","SavedAt"]]
+                        )
                         st.success("Uploaded and appended!")
                         st.rerun()
             except Exception as e:
                 st.error(f"Failed to read CSV: {e}")
+
+# ============================================================
+# PAGE: TRUCK PRIORITY (REAL SEQUENCING)
+# ============================================================
+elif page == "Truck_Priority":
+    st.title("⭐ Truck_Priority (Real Sequencing)")
+    st.caption("Headers are on row 9 in Google Sheets (we read using header=8).")
+
+    if truck_priority.empty:
+        st.info("Truck_Priority sheet is empty or not found.")
+        st.stop()
+
+    st.subheader("Truck_Priority (Live)")
+    q = st.text_input("Search Truck_Priority")
+    view = table_search(truck_priority, q)
+
+    st.dataframe(view, use_container_width=True)
+
+    st.download_button(
+        "⬇️ Download Truck_Priority CSV",
+        data=view.to_csv(index=False).encode("utf-8"),
+        file_name="truck_priority.csv",
+        mime="text/csv",
+    )
 
 # ============================================================
 # PAGE: SEQUENCING (ROW RANK PER TRUCK/ROW)
@@ -237,17 +256,18 @@ elif page == "Sequencing (Row Rank)":
         st.error("Data Main Sheet must include 'Truck ID/Name' and 'Earliest Delivery Date'.")
         st.stop()
 
-    # Rank per row: earliest EDD first; tie-break by Truck ID/Name
     ranked = df.sort_values(["Earliest Delivery Date", "Truck ID/Name"], ascending=[True, True]).reset_index(drop=True)
     ranked["Row Rank (EDD)"] = np.arange(1, len(ranked) + 1)
 
     st.subheader("Ranked rows (Rank 1 = earliest EDD)")
     q = st.text_input("Search ranked table")
-    st.dataframe(table_search(ranked, q), use_container_width=True)
+    view = table_search(ranked, q)
+
+    st.dataframe(view, use_container_width=True)
 
     st.download_button(
         "⬇️ Download ranked CSV",
-        data=table_search(ranked, q).to_csv(index=False).encode("utf-8"),
+        data=view.to_csv(index=False).encode("utf-8"),
         file_name="sequencing_ranked.csv",
         mime="text/csv",
     )
@@ -271,7 +291,6 @@ elif page == "SKU MASTER":
 
     lookup_id = st.text_input("Enter SKU_ID (e.g., A8)", key="sku_lookup")
     if lookup_id:
-        # Try to detect ID and Name columns
         cols_lower = {c.lower(): c for c in sku_master.columns}
         id_col = cols_lower.get("sku_id") or cols_lower.get("sku id") or list(sku_master.columns)[1]
         name_col = cols_lower.get("sku name") or cols_lower.get("sku") or list(sku_master.columns)[0]
