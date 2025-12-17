@@ -1,10 +1,11 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import datetime, date
+from datetime import datetime, date, time as dtime
 import plotly.express as px
 import time
 import random
+import re
 
 from streamlit_gsheets import GSheetsConnection
 
@@ -73,7 +74,7 @@ def filter_by_edd(df: pd.DataFrame, from_dt: pd.Timestamp, to_dt_excl: pd.Timest
     return df[(df["Earliest Delivery Date"] >= from_dt) & (df["Earliest Delivery Date"] < to_dt_excl)]
 
 # ============================================================
-# WRITE HELPERS (gspread) - insert into first blank row
+# WRITE HELPERS (gspread)
 # ============================================================
 def _get_gspread_client():
     cfg = st.secrets["connections"]["gsheets"]
@@ -219,6 +220,20 @@ except Exception:
 # Read FIRST sheet with headers row 5 => header index = 4
 input_sheet_df = read_ws(FIRST_SHEET_NAME, header=4) if FIRST_SHEET_NAME else pd.DataFrame()
 
+# Build SKU dropdown options from SKU MASTER column A
+sku_name_options = []
+sku_id_lookup = {}
+if not sku_master.empty:
+    # Show only A..E elsewhere, but for dropdown we only need A & B
+    # If your SKU MASTER already has named headers, this still works.
+    sku_names = sku_master.iloc[:, 0].astype(str).fillna("").tolist()
+    sku_ids = sku_master.iloc[:, 1].astype(str).fillna("").tolist() if sku_master.shape[1] > 1 else [""] * len(sku_names)
+    for n, sid in zip(sku_names, sku_ids):
+        n2 = n.strip()
+        if n2:
+            sku_name_options.append(n2)
+            sku_id_lookup[n2] = sid.strip()
+
 # ============================================================
 # PAGE: DASHBOARD
 # ============================================================
@@ -259,10 +274,10 @@ if page == "Dashboard":
     st.dataframe(table_search(df, q), use_container_width=True)
 
 # ============================================================
-# PAGE: INPUT
+# PAGE: INPUT (Push to Data Main)
 # ============================================================
 elif page == "Input (Push to Data Main)":
-    st.title("Input Sheet")  # BIG TITLE AS REQUESTED
+    st.title("Input Sheet")
 
     if not FIRST_SHEET_NAME:
         st.error("Could not detect the first worksheet name.")
@@ -270,11 +285,90 @@ elif page == "Input (Push to Data Main)":
 
     st.caption(f"Detected 1st tab: **{FIRST_SHEET_NAME}** (Headers row = 5)")
 
+    # ---- FORM that writes into the input sheet cells B6,B7,B8,B11,B12,B13,B14,B15 ----
+    st.subheader("Create / Update Input Form (writes to cells)")
+
+    with st.form("input_cells_form"):
+        colL, colR = st.columns(2)
+
+        with colL:
+            b6_date = st.date_input("B6 (Date)", value=date.today())
+            b7_time = st.time_input("B7 (Time)", value=datetime.now().time().replace(microsecond=0))
+
+            # B8 dropdown (SKU Name). B9 is formula, we do not write it.
+            if sku_name_options:
+                b8_sku_name = st.selectbox("B8 (SKU Name dropdown)", options=sku_name_options)
+            else:
+                b8_sku_name = st.text_input("B8 (SKU Name) — SKU MASTER not loaded", value="")
+
+            computed_sku_id = sku_id_lookup.get(b8_sku_name, "")
+            st.text_input("B9 (SKU_ID - auto from formula / lookup)", value=computed_sku_id, disabled=True)
+
+        with colR:
+            b11_truck = st.text_input("B11 (Truck ID format: DM-TA-224564)", value="")
+            b12_date = st.date_input("B12 (Date)", value=date.today())
+            b13_time = st.time_input("B13 (Time)", value=datetime.now().time().replace(microsecond=0))
+            b14_date = st.date_input("B14 (Date)", value=date.today())
+            b15_time = st.time_input("B15 (Time)", value=datetime.now().time().replace(microsecond=0))
+
+        submitted = st.form_submit_button("✅ Write to Input Sheet Cells")
+
+    if submitted:
+        # Validate B11 format like DM-TA-224564
+        pattern = r"^[A-Z]{2}-[A-Z]{2}-\d{6}$"
+        if b11_truck and (re.match(pattern, b11_truck.strip().upper()) is None):
+            st.error("B11 must be like: DM-TA-224564 (2 letters - 2 letters - 6 digits).")
+        else:
+            try:
+                sh2 = _open_spreadsheet()
+                ws_input = sh2.worksheet(FIRST_SHEET_NAME)
+
+                # Format date/time strings (Google Sheets will keep them as date/time if cell formatted)
+                b6_str = b6_date.strftime("%Y-%m-%d")
+                b7_str = b7_time.strftime("%H:%M:%S")
+
+                b12_str = b12_date.strftime("%Y-%m-%d")
+                b13_str = b13_time.strftime("%H:%M:%S")
+
+                b14_str = b14_date.strftime("%Y-%m-%d")
+                b15_str = b15_time.strftime("%H:%M:%S")
+
+                # Write required cells (do NOT touch B9)
+                updates = {
+                    "B6": b6_str,
+                    "B7": b7_str,
+                    "B8": b8_sku_name,              # dropdown value
+                    "B11": b11_truck.strip().upper(),
+                    "B12": b12_str,
+                    "B13": b13_str,
+                    "B14": b14_str,
+                    "B15": b15_str,
+                }
+
+                # batch update (fast)
+                cell_list = ws_input.range(f"B6:B15")
+                # Map cell objects by address
+                cell_map = {c.address: c for c in cell_list}
+                for addr, val in updates.items():
+                    if addr in cell_map:
+                        cell_map[addr].value = val
+
+                ws_input.update_cells(list(cell_map.values()))
+                st.success("Input cells updated! (B9 will auto-calculate in Google Sheet)")
+
+                st.cache_data.clear()
+                st.rerun()
+
+            except Exception as e:
+                st.error(f"Failed to write input cells: {e}")
+
+    st.divider()
+
+    # ---- Show A..C table (view + push) ----
     if input_sheet_df.empty:
         st.info("Input sheet is empty or could not be read.")
         st.stop()
 
-    # Only show columns A..C
     input_subset = input_sheet_df.iloc[:, 0:3] if input_sheet_df.shape[1] >= 3 else input_sheet_df
 
     st.subheader("Input Data (A–C)")
@@ -292,13 +386,12 @@ elif page == "Input (Push to Data Main)":
     )
 
     st.markdown("### Push selected rows into **Data Main Sheet**")
-    if st.button("🚀 Push Now"):
+    if st.button("🚀 Push Selected Rows"):
         selected_mask = edited["✅ Push?"] == True
         if selected_mask.sum() == 0:
             st.warning("No rows selected.")
         else:
             selected_idx = edited.index[selected_mask].tolist()
-
             try:
                 pushed_count = push_input_rows_to_data_main(view, selected_idx)
                 st.success(f"Pushed {pushed_count} row(s) into Data Main Sheet (first blank row in column A).")
@@ -318,7 +411,6 @@ elif page == "Truck_Priority":
         st.stop()
 
     subset = truck_priority.iloc[:, 6:11] if truck_priority.shape[1] >= 11 else truck_priority
-
     q = st.text_input("Search Truck_Priority (G–K)")
     st.dataframe(table_search(subset, q), use_container_width=True)
 
@@ -333,7 +425,6 @@ elif page == "SKU MASTER":
         st.stop()
 
     subset = sku_master.iloc[:, 0:5] if sku_master.shape[1] >= 5 else sku_master
-
     q = st.text_input("Search SKU MASTER (A–E)")
     st.dataframe(table_search(subset, q), use_container_width=True)
 
