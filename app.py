@@ -151,13 +151,13 @@ def ws_batch_update(ws, updates: dict, user_entered=True):
     )
 
 # ============================================================
-# INPUT FORM CELLS (your layout)
+# INPUT FORM (single range read)
 # ============================================================
 INPUT_FIELDS_ORDER = [
     "Delivery Date",
     "Delivery Time",
     "SKU",
-    "SKU ID",  # formula
+    "SKU ID",
     "Enter Quantity",
     "Truck ID/Name",
     "Vehicle Factory In Date",
@@ -165,21 +165,15 @@ INPUT_FIELDS_ORDER = [
     "Vehicle Factory Out Date",
     "Vehicle Factory Out Time",
 ]
-
-# B6:B15 corresponds to above order
 INPUT_RANGE = "B6:B15"
 
 def read_input_form_range(ws_input) -> dict:
-    """
-    ✅ One API call + retry/backoff to avoid gspread APIError.
-    """
     max_tries = 5
     base_sleep = 0.6
     for i in range(max_tries):
         try:
-            raw = ws_input.get(INPUT_RANGE)  # list of rows like [[val],[val],...]
+            raw = ws_input.get(INPUT_RANGE)
             flat = [r[0] if r else "" for r in raw]
-            # pad to 10
             while len(flat) < len(INPUT_FIELDS_ORDER):
                 flat.append("")
             return {k: flat[idx] for idx, k in enumerate(INPUT_FIELDS_ORDER)}
@@ -215,7 +209,6 @@ def push_current_input_to_data_main(input_tab_name: str):
     r = first_blank_row_colA(ws_main, start_row=2)
     ensure_rows(ws_main, r)
 
-    # ✅ ONLY A..I (J+ formulas untouched)
     updates = {
         f"A{r}": merged_A,
         f"B{r}": form["SKU"],
@@ -231,7 +224,7 @@ def push_current_input_to_data_main(input_tab_name: str):
     return r, form
 
 # ============================================================
-# DASHBOARD COLUMN DETECTION (fix charts)
+# DASHBOARD COLUMN DETECTION (robust)
 # ============================================================
 def pick_first_existing(df: pd.DataFrame, candidates: list[str]) -> str | None:
     cols_lower = {c.lower(): c for c in df.columns}
@@ -241,11 +234,23 @@ def pick_first_existing(df: pd.DataFrame, candidates: list[str]) -> str | None:
     return None
 
 def get_dashboard_columns(dm: pd.DataFrame):
-    # qty candidates
     qty_col = pick_first_existing(dm, ["Qnt(Bag)", "Qty(Bag)", "Qty", "Qnt", "Quantity"])
-    # edd candidates (by name)
     edd_col = pick_first_existing(dm, ["Earliest Delivery Date", "EDD", "EARLIEST DELIVERY DATE"])
-    return edd_col, qty_col
+    truck_col = pick_first_existing(dm, ["Truck ID/Name", "Truck", "Truck ID"])
+    sku_id_col = pick_first_existing(dm, ["SKU ID", "SKU_ID", "Sku ID"])
+    return edd_col, qty_col, truck_col, sku_id_col
+
+def fallback_by_position(dm: pd.DataFrame):
+    """
+    If headers are weird/missing, fallback based on your known structure:
+    C = SKU ID, D = Qty, E = Truck, L = EDD
+    """
+    cols = list(dm.columns)
+    edd_col = cols[11] if len(cols) > 11 else None  # L
+    qty_col = cols[3] if len(cols) > 3 else None    # D
+    truck_col = cols[4] if len(cols) > 4 else None  # E
+    sku_id_col = cols[2] if len(cols) > 2 else None # C
+    return edd_col, qty_col, truck_col, sku_id_col
 
 # ============================================================
 # SIDEBAR / NAV + DATE FILTER
@@ -278,7 +283,9 @@ if st.sidebar.button("🔄 Refresh data"):
 # ============================================================
 # LOAD SHEETS
 # ============================================================
-data_main = read_ws("Data Main Sheet")
+# ✅ KEY FIX: Data Main headers are in row 7 => header=6
+data_main = read_ws("Data Main Sheet", header=6)
+
 sku_master = read_ws("SKU MASTER")
 truck_lp = read_ws("Truck_LoadPlan", header=6)
 truck_priority = read_ws("Truck_Priority", header=8)
@@ -291,13 +298,13 @@ try:
 except Exception:
     INPUT_TAB_NAME = ""
 
-# SKU dropdown from SKU MASTER (first col)
+# SKU dropdown from SKU MASTER
 sku_name_options = []
 if not sku_master.empty and sku_master.shape[1] >= 1:
     sku_name_options = [x.strip() for x in sku_master.iloc[:, 0].astype(str).fillna("") if x.strip()]
 
 # ============================================================
-# DASHBOARD (charts fixed)
+# DASHBOARD (interactive top + charts)
 # ============================================================
 if page == "Dashboard":
     st.title("🚚 Dashboard")
@@ -307,9 +314,17 @@ if page == "Dashboard":
         st.info("Data Main Sheet is empty.")
         st.stop()
 
-    edd_col, qty_col = get_dashboard_columns(dm)
+    edd_col, qty_col, truck_col, sku_id_col = get_dashboard_columns(dm)
 
-    # Filter by EDD if we found it
+    # fallback if names still not detected
+    if not (edd_col and qty_col and truck_col):
+        f_edd, f_qty, f_truck, f_sku = fallback_by_position(dm)
+        edd_col = edd_col or f_edd
+        qty_col = qty_col or f_qty
+        truck_col = truck_col or f_truck
+        sku_id_col = sku_id_col or f_sku
+
+    # parse / filter by date range using EDD
     if edd_col:
         dm[edd_col] = pd.to_datetime(dm[edd_col], errors="coerce")
         dm = dm[(dm[edd_col] >= from_dt) & (dm[edd_col] < to_dt_excl)]
@@ -318,11 +333,43 @@ if page == "Dashboard":
         st.info("No data found for selected date range.")
         st.stop()
 
+    # ✅ interactive controls (upper portion)
+    with st.container():
+        cA, cB, cC, cD = st.columns([2, 2, 2, 1])
+
+        selected_trucks = None
+        selected_skus = None
+        top_n = 15
+
+        if truck_col:
+            all_trucks = sorted([x for x in dm[truck_col].astype(str).unique() if x.strip()])
+            with cA:
+                selected_trucks = st.multiselect("Filter Trucks", all_trucks, default=[])
+        if sku_id_col:
+            all_skus = sorted([x for x in dm[sku_id_col].astype(str).unique() if x.strip()])
+            with cB:
+                selected_skus = st.multiselect("Filter SKU IDs", all_skus, default=[])
+        with cC:
+            top_n = st.slider("Top N Trucks (bar chart)", 5, 30, 15)
+        with cD:
+            st.write("")
+            st.write("")
+            if st.button("Clear Filters"):
+                st.rerun()
+
+    # apply filters
+    if truck_col and selected_trucks:
+        dm = dm[dm[truck_col].astype(str).isin(selected_trucks)]
+    if sku_id_col and selected_skus:
+        dm = dm[dm[sku_id_col].astype(str).isin(selected_skus)]
+
+    if dm.empty:
+        st.info("No rows after filters.")
+        st.stop()
+
+    # metrics
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Rows", f"{len(dm):,}")
-    truck_col = pick_first_existing(dm, ["Truck ID/Name", "Truck", "Truck ID", "Truck ID/Name "])
-    sku_id_col = pick_first_existing(dm, ["SKU ID", "SKU_ID", "Sku ID"])
-
     if truck_col:
         c2.metric("Trucks", f"{dm[truck_col].nunique():,}")
     if sku_id_col:
@@ -332,8 +379,10 @@ if page == "Dashboard":
         c4.metric("Total Bags", f"{dm[qty_col].sum():,.0f}")
 
     st.divider()
+
     left, right = st.columns(2)
 
+    # ✅ charts should show now
     with left:
         if edd_col and qty_col:
             tmp = dm.copy()
@@ -341,20 +390,20 @@ if page == "Dashboard":
             daily = tmp.groupby("EDD_Date", as_index=False)[qty_col].sum()
             st.plotly_chart(px.line(daily, x="EDD_Date", y=qty_col, markers=True), use_container_width=True)
         else:
-            st.info("Line chart needs EDD column (Earliest Delivery Date/EDD) and qty column (Qnt(Bag)/Qty(Bag)).")
+            st.error("Cannot build line chart (EDD/Qty columns not detected).")
 
     with right:
         if truck_col and qty_col:
-            top = dm.groupby(truck_col, as_index=False)[qty_col].sum().sort_values(qty_col, ascending=False).head(15)
+            top = dm.groupby(truck_col, as_index=False)[qty_col].sum().sort_values(qty_col, ascending=False).head(top_n)
             st.plotly_chart(px.bar(top, x=truck_col, y=qty_col), use_container_width=True)
         else:
-            st.info("Bar chart needs Truck column (Truck ID/Name) and qty column (Qnt(Bag)/Qty(Bag)).")
+            st.error("Cannot build bar chart (Truck/Qty columns not detected).")
 
     st.subheader("Filtered Data Preview")
     st.dataframe(dm.head(300), use_container_width=True)
 
 # ============================================================
-# INPUT PAGE (APIError fixed)
+# INPUT PAGE (unchanged)
 # ============================================================
 elif page == "Input (Push to Data Main)":
     st.title("Input Sheet")
@@ -368,7 +417,6 @@ elif page == "Input (Push to Data Main)":
     sh_live = _open_spreadsheet()
     ws_input = sh_live.worksheet(INPUT_TAB_NAME)
 
-    # always read current (single API call)
     try:
         current = read_input_form_range(ws_input)
     except Exception as e:
@@ -437,7 +485,6 @@ elif page == "Input (Push to Data Main)":
             st.stop()
 
         try:
-            # DO NOT touch B9
             updates = {
                 "B6": delivery_date.strftime("%Y-%m-%d"),
                 "B7": str(delivery_time).strip().upper(),
@@ -451,19 +498,16 @@ elif page == "Input (Push to Data Main)":
             }
             ws_batch_update(ws_input, updates, user_entered=True)
 
-            # wait for B9 formula to compute then reread once
             time.sleep(0.6)
             current = read_input_form_range(ws_input)
 
             st.success("Saved. SKU ID (B9) updated automatically by sheet formula.")
-
         except Exception as e:
             st.error(f"Failed to save: {e}")
 
     st.divider()
     st.subheader("Part 2: Push to Data Main Sheet")
 
-    # live preview (no repeated per-cell API calls)
     try:
         current = read_input_form_range(ws_input)
         preview = pd.DataFrame([{"Field": k, "Value": v} for k, v in current.items()])
@@ -505,20 +549,32 @@ elif page == "Truck_LoadPlan":
 elif page == "Data Main Sheet":
     st.title("📄 Data Main Sheet (Filtered by sidebar date range)")
     dm = data_main.copy()
-    edd_col, _ = get_dashboard_columns(dm)
+
+    edd_col, qty_col, truck_col, sku_id_col = get_dashboard_columns(dm)
+    if not edd_col:
+        edd_col = fallback_by_position(dm)[0]
+
     if not dm.empty and edd_col:
         dm[edd_col] = pd.to_datetime(dm[edd_col], errors="coerce")
         dm = dm[(dm[edd_col] >= from_dt) & (dm[edd_col] < to_dt_excl)]
+
     q = st.text_input("Search")
     st.dataframe(table_search(dm, q), use_container_width=True)
 
 else:
     st.title("🔢 Sequencing (Row Rank)")
     dm = data_main.copy()
-    edd_col, _ = get_dashboard_columns(dm)
+
+    edd_col, qty_col, truck_col, sku_id_col = get_dashboard_columns(dm)
+    if not edd_col:
+        edd_col = fallback_by_position(dm)[0]
+    if not truck_col:
+        truck_col = fallback_by_position(dm)[2]
+
     if not dm.empty and edd_col:
         dm[edd_col] = pd.to_datetime(dm[edd_col], errors="coerce")
         dm = dm[(dm[edd_col] >= from_dt) & (dm[edd_col] < to_dt_excl)]
+
     if dm.empty:
         st.info("No rows in selected date range.")
         st.stop()
@@ -526,7 +582,6 @@ else:
     sort_cols = []
     if edd_col:
         sort_cols.append(edd_col)
-    truck_col = pick_first_existing(dm, ["Truck ID/Name", "Truck", "Truck ID"])
     if truck_col:
         sort_cols.append(truck_col)
 
