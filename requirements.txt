@@ -5,4 +5,5 @@ plotly>=5.18
 st-gsheets-connection>=0.1.0
 gspread
 google-auth
+st-time-entry==0.4.0
 
