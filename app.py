@@ -150,26 +150,40 @@ def _open_spreadsheet():
         return gc.open_by_url(spreadsheet)
     return gc.open_by_key(spreadsheet)
 
-def first_blank_row_colA(ws, start_row=2) -> int:
-    max_row = ws.row_count
-    colA = ws.col_values(1)
-    if len(colA) < max_row:
-        colA = colA + [""] * (max_row - len(colA))
-    for r in range(start_row, max_row + 1):
-        if str(colA[r - 1]).strip() == "":
-            return r
-    return max_row + 1
-
-def ensure_rows(ws, needed_last_row: int):
-    if needed_last_row > ws.row_count:
-        ws.add_rows(needed_last_row - ws.row_count)
-
 def ws_batch_update(ws, updates: dict, user_entered=True):
     data = [{"range": a1, "values": [[val]]} for a1, val in updates.items()]
     ws.batch_update(
         data,
         value_input_option="USER_ENTERED" if user_entered else "RAW"
     )
+
+# ============================================================
+# ✅ NEW: sync sidebar date range into Truck_LoadPlan!B1 and E1
+# ============================================================
+def sync_date_range_to_truckloadplan(from_d: date, to_d: date):
+    """
+    Writes:
+      Truck_LoadPlan!B1 = from date
+      Truck_LoadPlan!E1 = to date
+    Only writes if changed to avoid hammering the API.
+    """
+    sh = _open_spreadsheet()
+    ws = sh.worksheet("Truck_LoadPlan")
+
+    # read existing values (best effort)
+    try:
+        current_b1 = (ws.acell("B1").value or "").strip()
+        current_e1 = (ws.acell("E1").value or "").strip()
+    except Exception:
+        current_b1, current_e1 = "", ""
+
+    new_b1 = from_d.strftime("%Y-%m-%d")
+    new_e1 = to_d.strftime("%Y-%m-%d")
+
+    if current_b1 == new_b1 and current_e1 == new_e1:
+        return
+
+    ws_batch_update(ws, {"B1": new_b1, "E1": new_e1}, user_entered=True)
 
 # ============================================================
 # INPUT FORM (single range read)
@@ -189,21 +203,25 @@ INPUT_FIELDS_ORDER = [
 INPUT_RANGE = "B6:B15"
 
 def read_input_form_range(ws_input) -> dict:
-    max_tries = 5
-    base_sleep = 0.6
-    for i in range(max_tries):
-        try:
-            raw = ws_input.get(INPUT_RANGE)
-            flat = [r[0] if r else "" for r in raw]
-            while len(flat) < len(INPUT_FIELDS_ORDER):
-                flat.append("")
-            return {k: flat[idx] for idx, k in enumerate(INPUT_FIELDS_ORDER)}
-        except Exception as e:
-            msg = str(e).lower()
-            transient = any(x in msg for x in ["429", "rate", "quota", "500", "503", "timeout", "temporarily"])
-            if (not transient) or (i == max_tries - 1):
-                raise
-            time.sleep((base_sleep * (2 ** i)) + random.uniform(0, 0.25))
+    raw = ws_input.get(INPUT_RANGE)
+    flat = [r[0] if r else "" for r in raw]
+    while len(flat) < len(INPUT_FIELDS_ORDER):
+        flat.append("")
+    return {k: flat[idx] for idx, k in enumerate(INPUT_FIELDS_ORDER)}
+
+def first_blank_row_colA(ws, start_row=2) -> int:
+    max_row = ws.row_count
+    colA = ws.col_values(1)
+    if len(colA) < max_row:
+        colA = colA + [""] * (max_row - len(colA))
+    for r in range(start_row, max_row + 1):
+        if str(colA[r - 1]).strip() == "":
+            return r
+    return max_row + 1
+
+def ensure_rows(ws, needed_last_row: int):
+    if needed_last_row > ws.row_count:
+        ws.add_rows(needed_last_row - ws.row_count)
 
 def push_current_input_to_data_main(input_tab_name: str):
     sh = _open_spreadsheet()
@@ -258,9 +276,6 @@ def _safe_colname(x) -> str:
     return str(x).strip()
 
 def pick_first_existing(df: pd.DataFrame, candidates: list[str]) -> str | None:
-    """
-    ✅ FIX: df.columns may contain non-strings / NaN / None.
-    """
     cols_lower = {}
     for c in df.columns:
         name = _safe_colname(c)
@@ -308,6 +323,18 @@ page = st.sidebar.radio(
 st.sidebar.markdown("### Date Range (Earliest Delivery Date)")
 from_date = st.sidebar.date_input("From", value=date(2025, 12, 12))
 to_date = st.sidebar.date_input("To", value=date(2025, 12, 18))
+
+# ✅ sync dates into Truck_LoadPlan cells (B1/E1) with no extra UI changes
+try:
+    prev_from = st.session_state.get("_prev_from_date")
+    prev_to = st.session_state.get("_prev_to_date")
+    if prev_from != from_date or prev_to != to_date:
+        sync_date_range_to_truckloadplan(from_date, to_date)
+        st.session_state["_prev_from_date"] = from_date
+        st.session_state["_prev_to_date"] = to_date
+except Exception as e:
+    st.sidebar.warning(f"Could not sync date range to Truck_LoadPlan: {e}")
+
 from_dt = pd.to_datetime(from_date)
 to_dt_excl = pd.to_datetime(to_date) + pd.Timedelta(days=1)
 
@@ -318,8 +345,8 @@ if st.sidebar.button("🔄 Refresh data"):
 # ============================================================
 # LOAD SHEETS
 # ============================================================
-data_main = read_ws("Data Main Sheet", header=0)  # headers row 7
-sku_master = read_ws("SKU MASTER", header=1)
+data_main = read_ws("Data Main Sheet", header=6)  # headers row 7
+sku_master = read_ws("SKU MASTER")
 truck_lp = read_ws("Truck_LoadPlan", header=6)
 truck_priority = read_ws("Truck_Priority", header=8)
 
@@ -337,7 +364,7 @@ if not sku_master.empty and sku_master.shape[1] >= 1:
     sku_name_options = [x.strip() for x in sku_master.iloc[:, 0].astype(str).fillna("") if x.strip()]
 
 # ============================================================
-# DASHBOARD (now works)
+# DASHBOARD
 # ============================================================
 if page == "Dashboard":
     st.title("🚚 Dashboard")
@@ -363,7 +390,6 @@ if page == "Dashboard":
         st.info("No data found for selected date range.")
         st.stop()
 
-    # Interactive controls
     with st.container():
         cA, cB, cC, cD = st.columns([2, 2, 2, 1])
         selected_trucks = []
@@ -446,7 +472,7 @@ if page == "Dashboard":
     st.dataframe(dm.head(300), use_container_width=True)
 
 # ============================================================
-# INPUT PAGE (visual clock picker kept)
+# INPUT PAGE (unchanged)
 # ============================================================
 elif page == "Input (Push to Data Main)":
     st.title("Input Sheet")
@@ -489,9 +515,7 @@ elif page == "Input (Push to Data Main)":
                 )
                 delivery_time = time_to_12h_str_from_timeobj(delivery_time_obj)
 
-            if not sku_master.empty and sku_master.shape[1] >= 1:
-                pass
-            else:
+            if not sku_name_options:
                 st.error("SKU MASTER is empty (cannot build dropdown).")
                 st.stop()
 
