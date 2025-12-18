@@ -58,6 +58,29 @@ def read_ws(worksheet: str, header: int | None = None) -> pd.DataFrame:
                 return pd.DataFrame()
             time.sleep((base_sleep * (2 ** i)) + random.uniform(0, 0.3))
 
+# ✅ NEW: fresh read (no cache) for dynamic sheets
+def read_ws_fresh(worksheet: str, header: int | None = None, ttl: int = 0) -> pd.DataFrame:
+    """
+    Read directly from streamlit_gsheets without our cache,
+    so it updates immediately after B1/E1 changes.
+    """
+    max_tries = 5
+    base_sleep = 0.7
+    for i in range(max_tries):
+        try:
+            if header is None:
+                df = conn.read(worksheet=worksheet, ttl=ttl)
+            else:
+                df = conn.read(worksheet=worksheet, header=header, ttl=ttl)
+            return df if df is not None else pd.DataFrame()
+        except Exception as e:
+            msg = str(e).lower()
+            transient = any(x in msg for x in ["429", "rate", "quota", "500", "503", "timeout", "temporarily"])
+            if (not transient) or (i == max_tries - 1):
+                st.error(f"Google Sheets API error while reading '{worksheet}'.\n\n{e}")
+                return pd.DataFrame()
+            time.sleep((base_sleep * (2 ** i)) + random.uniform(0, 0.3))
+
 # ============================================================
 # FORMATTING / VALIDATION
 # ============================================================
@@ -158,19 +181,12 @@ def ws_batch_update(ws, updates: dict, user_entered=True):
     )
 
 # ============================================================
-# ✅ NEW: sync sidebar date range into Truck_LoadPlan!B1 and E1
+# ✅ sync sidebar date range into Truck_LoadPlan!B1 and E1
 # ============================================================
 def sync_date_range_to_truckloadplan(from_d: date, to_d: date):
-    """
-    Writes:
-      Truck_LoadPlan!B1 = from date
-      Truck_LoadPlan!E1 = to date
-    Only writes if changed to avoid hammering the API.
-    """
     sh = _open_spreadsheet()
     ws = sh.worksheet("Truck_LoadPlan")
 
-    # read existing values (best effort)
     try:
         current_b1 = (ws.acell("B1").value or "").strip()
         current_e1 = (ws.acell("E1").value or "").strip()
@@ -186,7 +202,7 @@ def sync_date_range_to_truckloadplan(from_d: date, to_d: date):
     ws_batch_update(ws, {"B1": new_b1, "E1": new_e1}, user_entered=True)
 
 # ============================================================
-# INPUT FORM (single range read)
+# INPUT FORM
 # ============================================================
 INPUT_FIELDS_ORDER = [
     "Delivery Date",
@@ -302,6 +318,24 @@ def fallback_by_position(dm: pd.DataFrame):
     sku_id_col = cols[2] if len(cols) > 2 else None # C
     return edd_col, qty_col, truck_col, sku_id_col
 
+# ✅ NEW: date filtering helper for dynamic sheets
+def filter_by_date_if_possible(df: pd.DataFrame, from_dt: pd.Timestamp, to_dt_excl: pd.Timestamp) -> pd.DataFrame:
+    if df.empty:
+        return df
+    date_col = pick_first_existing(
+        df,
+        [
+            "Earliest Delivery Date", "EDD",
+            "Delivery Date & Time", "Delivery Date Time", "Delivery Date",
+            "Date"
+        ],
+    )
+    if not date_col or date_col not in df.columns:
+        return df  # no date column, show as-is
+
+    s = pd.to_datetime(df[date_col], errors="coerce")
+    return df[(s.notna()) & (s >= from_dt) & (s < to_dt_excl)]
+
 # ============================================================
 # SIDEBAR / NAV + DATE FILTER
 # ============================================================
@@ -324,12 +358,14 @@ st.sidebar.markdown("### Date Range (Earliest Delivery Date)")
 from_date = st.sidebar.date_input("From", value=date(2025, 12, 12))
 to_date = st.sidebar.date_input("To", value=date(2025, 12, 18))
 
-# ✅ sync dates into Truck_LoadPlan cells (B1/E1) with no extra UI changes
+# ✅ sync dates into Truck_LoadPlan cells (B1/E1)
 try:
     prev_from = st.session_state.get("_prev_from_date")
     prev_to = st.session_state.get("_prev_to_date")
     if prev_from != from_date or prev_to != to_date:
         sync_date_range_to_truckloadplan(from_date, to_date)
+        # give Google Sheet a tiny moment to recalc formulas
+        time.sleep(0.4)
         st.session_state["_prev_from_date"] = from_date
         st.session_state["_prev_to_date"] = to_date
 except Exception as e:
@@ -345,10 +381,11 @@ if st.sidebar.button("🔄 Refresh data"):
 # ============================================================
 # LOAD SHEETS
 # ============================================================
-data_main = read_ws("Data Main Sheet", header=0)  # headers row 7
-sku_master = read_ws("SKU MASTER", header=1)
-truck_lp = read_ws("Truck_LoadPlan", header=6)
-truck_priority = read_ws("Truck_Priority", header=8)
+data_main = read_ws("Data Main Sheet", header=6)  # headers row 7
+sku_master = read_ws("SKU MASTER")
+
+# NOTE: Truck_LoadPlan + Truck_Priority will be read fresh inside their pages
+# so they become dynamic with date range.
 
 # detect input tab (first sheet)
 try:
@@ -616,14 +653,27 @@ elif page == "Input (Push to Data Main)":
         except Exception as e:
             st.error(f"Failed to push: {e}")
 
+# ============================================================
+# ✅ Truck_Priority (NOW DYNAMIC by date range)
+# ============================================================
 elif page == "Truck_Priority":
     st.title("⭐ Truck_Priority (G–K only)")
+
+    # fresh read every time so it reflects updated formulas
+    truck_priority = read_ws_fresh("Truck_Priority", header=8, ttl=0)
     if truck_priority.empty:
         st.info("Truck_Priority sheet is empty or not found.")
         st.stop()
+
+    # also filter by date range if it has a date column
+    truck_priority = filter_by_date_if_possible(truck_priority, from_dt, to_dt_excl)
+
     subset = truck_priority.iloc[:, 6:11] if truck_priority.shape[1] >= 11 else truck_priority
     st.dataframe(subset, use_container_width=True)
 
+# ============================================================
+# SKU MASTER (unchanged)
+# ============================================================
 elif page == "SKU MASTER":
     st.title("📦 SKU MASTER (A–E only)")
     if sku_master.empty:
@@ -632,10 +682,26 @@ elif page == "SKU MASTER":
     subset = sku_master.iloc[:, 0:5] if sku_master.shape[1] >= 5 else sku_master
     st.dataframe(subset, use_container_width=True)
 
+# ============================================================
+# ✅ Truck_LoadPlan (NOW DYNAMIC by date range)
+# ============================================================
 elif page == "Truck_LoadPlan":
     st.title("🧾 Truck_LoadPlan (View only)")
+
+    # fresh read every time so it reflects date-driven formulas
+    truck_lp = read_ws_fresh("Truck_LoadPlan", header=6, ttl=0)
+    if truck_lp.empty:
+        st.info("Truck_LoadPlan sheet is empty or not found.")
+        st.stop()
+
+    # also filter by date range if possible
+    truck_lp = filter_by_date_if_possible(truck_lp, from_dt, to_dt_excl)
+
     st.dataframe(truck_lp, use_container_width=True)
 
+# ============================================================
+# Data Main Sheet (unchanged)
+# ============================================================
 elif page == "Data Main Sheet":
     st.title("📄 Data Main Sheet (Filtered by sidebar date range)")
     dm = data_main.copy()
@@ -648,6 +714,9 @@ elif page == "Data Main Sheet":
     q = st.text_input("Search")
     st.dataframe(table_search(dm, q), use_container_width=True)
 
+# ============================================================
+# Sequencing (unchanged)
+# ============================================================
 else:
     st.title("🔢 Sequencing (Row Rank)")
     dm = data_main.copy()
