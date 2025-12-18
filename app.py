@@ -345,8 +345,8 @@ if st.sidebar.button("🔄 Refresh data"):
 # ============================================================
 # LOAD SHEETS
 # ============================================================
-data_main = read_ws("Data Main Sheet", header=6)  # headers row 7
-sku_master = read_ws("SKU MASTER")
+data_main = read_ws("Data Main Sheet", header=0)  # headers row 7
+sku_master = read_ws("SKU MASTER", header=1)
 truck_lp = read_ws("Truck_LoadPlan", header=6)
 truck_priority = read_ws("Truck_Priority", header=8)
 
